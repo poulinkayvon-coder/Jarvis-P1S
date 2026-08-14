@@ -23,7 +23,11 @@ final class JarvisAppModel: ObservableObject {
 
     init() {
         rebuildPrinter()
-        if !configured { showSetup = true }
+        if !configured {
+            showSetup = true
+        } else {
+            Task { await getStatus(showSuccessMessage: false) }
+        }
     }
 
     func configure(host: String, serial: String, accessCode: String) {
@@ -34,7 +38,9 @@ final class JarvisAppModel: ObservableObject {
         UserDefaults.standard.set(cleanSerial, forKey: "p1s.serial")
         Keychain.set(cleanCode, for: "p1s.accessCode")
         rebuildPrinter()
-        messages.append(("P1S connection saved. I can now use the printer on your local network.", false))
+        status = PrinterStatus()
+        messages.append(("P1S connection saved. Testing the local connection…", false))
+        Task { await getStatus(showSuccessMessage: true) }
     }
 
     private func rebuildPrinter() {
@@ -66,7 +72,7 @@ final class JarvisAppModel: ObservableObject {
         }
 
         switch parser.parse(text) {
-        case .status: Task { await getStatus() }
+        case .status: Task { await getStatus(showSuccessMessage: true) }
         case .pause: Task { await printerAction("pause") { try await self.requirePrinter().pause() } }
         case .resume: Task { await printerAction("resume") { try await self.requirePrinter().resume() } }
         case .cancel: Task { await printerAction("stop") { try await self.requirePrinter().cancel() } }
@@ -82,13 +88,29 @@ final class JarvisAppModel: ObservableObject {
         return printer
     }
 
-    private func getStatus() async {
+    private func getStatus(showSuccessMessage: Bool) async {
+        guard !isBusy else { return }
+        guard let host = UserDefaults.standard.string(forKey: "p1s.host"),
+              let serial = UserDefaults.standard.string(forKey: "p1s.serial"),
+              let code = Keychain.get("p1s.accessCode"),
+              !host.isEmpty, !serial.isEmpty, !code.isEmpty else {
+            messages.append(("P1S connection details are incomplete. Open Setup and check them.", false))
+            return
+        }
+
+        isBusy = true
+        defer { isBusy = false }
+
         do {
-            let p = try requirePrinter()
-            status = try await p.status()
-            messages.append(("The printer is \(status.state.rawValue). \(Int(status.progress))% complete.", false))
+            let probe = P1SStatusProbe(host: host, serial: serial, accessCode: code)
+            let newStatus = try await probe.fetchStatus()
+            status = newStatus
+            if showSuccessMessage {
+                messages.append(("P1S connected. Printer state: \(newStatus.state.rawValue). \(Int(newStatus.progress))% complete.", false))
+            }
         } catch {
-            messages.append(("I couldn't read the P1S: \(error.localizedDescription)", false))
+            status = PrinterStatus(state: .offline, errorMessage: error.localizedDescription)
+            messages.append(("P1S connection failed: \(error.localizedDescription)", false))
         }
     }
 
@@ -121,6 +143,9 @@ final class JarvisAppModel: ObservableObject {
     }
 
     private func printerAction(_ name: String, _ action: @escaping () async throws -> Void) async {
+        guard !isBusy else { return }
+        isBusy = true
+        defer { isBusy = false }
         do {
             try await action()
             messages.append(("P1S \(name) command sent.", false))
