@@ -6,6 +6,15 @@ struct CommandParser {
             .replacingOccurrences(of: "hey jarvis", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
+        let confirms = ["yes", "yeah", "yep", "confirm", "do it", "go ahead", "print it", "start it"]
+        if confirms.contains(s) || s.hasPrefix("yes ") || s.hasPrefix("confirm ") {
+            return .confirmPrint
+        }
+        let declines = ["no", "nope", "cancel that", "don't print", "do not print", "never mind", "nevermind"]
+        if declines.contains(s) || s.hasPrefix("no ") {
+            return .declinePrint
+        }
+
         if s.contains("status") || (s.contains("what") && s.contains("printer")) {
             return .status
         }
@@ -34,7 +43,7 @@ struct CommandParser {
         }
 
         var color: String?
-        let colors = ["red", "blue", "green", "yellow", "orange", "purple", "white", "black", "gray", "grey"]
+        let colors = ["red", "blue", "green", "yellow", "orange", "purple", "white", "black", "gray", "grey", "pink", "brown"]
         for c in colors where object.contains(c) {
             color = c
             object = object.replacingOccurrences(of: c, with: "")
@@ -44,6 +53,7 @@ struct CommandParser {
         object = object
             .replacingOccurrences(of: "using ams", with: "")
             .replacingOccurrences(of: "in the ams", with: "")
+            .replacingOccurrences(of: "for me", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         return object.isEmpty ? .unknown : .findAndPrint(query: object, requestedColor: color, requestedSlot: slot)
