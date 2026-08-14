@@ -9,36 +9,68 @@ jobs:
   build:
     runs-on: macos-15-intel
     steps:
-      - name: Checkout
+      - name: Checkout current commit
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          clean: true
 
-      - name: Show Xcode version
-        run: xcodebuild -version
-
-      - name: Build Jarvis for iPhone
+      - name: Show source and Xcode version
         run: |
-          rm -rf build Payload JarvisP1S-unsigned.ipa
+          echo "Building commit: $GITHUB_SHA"
+          xcodebuild -version
+          grep -F "MakerWorld search" ContentView.swift
+          if grep -Fq "Import sliced 3MF" ContentView.swift; then
+            echo "ERROR: checkout contains the old UI source"
+            exit 1
+          fi
+
+      - name: Build Jarvis for iPhone from scratch
+        run: |
+          rm -rf build Payload DerivedData JarvisP1S-unsigned.ipa
           xcodebuild \
             -project JarvisP1S.xcodeproj \
             -scheme JarvisP1S \
             -sdk iphoneos \
             -configuration Release \
+            -derivedDataPath "$PWD/DerivedData" \
             CONFIGURATION_BUILD_DIR="$PWD/build/JarvisP1S" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            build
+            clean build
 
-      - name: Package unsigned IPA
+      - name: Verify compiled app is current
+        run: |
+          test -f build/JarvisP1S/JarvisP1S.app/JarvisP1S
+          strings build/JarvisP1S/JarvisP1S.app/JarvisP1S > compiled-strings.txt
+          grep -F "MakerWorld search" compiled-strings.txt
+          if grep -Fq "Import sliced 3MF" compiled-strings.txt; then
+            echo "ERROR: compiled app still contains the old Import sliced 3MF UI"
+            exit 1
+          fi
+          echo "Verified: compiled binary contains current MakerWorld UI and not the old import UI."
+
+      - name: Package and verify unsigned IPA
         run: |
           mkdir -p Payload
           cp -R build/JarvisP1S/JarvisP1S.app Payload/JarvisP1S.app
           /usr/bin/zip -qry JarvisP1S-unsigned.ipa Payload
+          rm -rf verify-ipa
+          mkdir verify-ipa
+          ditto -x -k JarvisP1S-unsigned.ipa verify-ipa
+          strings verify-ipa/Payload/JarvisP1S.app/JarvisP1S > ipa-strings.txt
+          grep -F "MakerWorld search" ipa-strings.txt
+          if grep -Fq "Import sliced 3MF" ipa-strings.txt; then
+            echo "ERROR: packaged IPA contains old UI"
+            exit 1
+          fi
+          shasum -a 256 JarvisP1S-unsigned.ipa
           ls -lh JarvisP1S-unsigned.ipa
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: JarvisP1S-unsigned-IPA
+          name: JarvisP1S-current-unsigned-IPA
           path: JarvisP1S-unsigned.ipa
           if-no-files-found: error
           retention-days: 7
