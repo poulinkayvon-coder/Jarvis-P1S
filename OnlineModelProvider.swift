@@ -10,7 +10,7 @@ struct MakerWorldProvider: ModelProvider {
     func searchPrintProfiles(query: String, printer: String, nozzle: String, material: String) async throws -> [ModelCandidate] {
         var components = URLComponents(string: "https://makerworld.com/en/search/models")!
         components.queryItems = [URLQueryItem(name: "keyword", value: query)]
-        guard let url = components.url else { throw JarvisError.onlineSearchFailed }
+        guard let url = components.url else { throw ProviderError.searchFailed }
 
         var request = URLRequest(url: url)
         request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
@@ -19,7 +19,7 @@ struct MakerWorldProvider: ModelProvider {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
               let html = String(data: data, encoding: .utf8) else {
-            throw JarvisError.onlineSearchFailed
+            throw ProviderError.searchFailed
         }
 
         let links = Self.extractModelLinks(from: html)
@@ -49,11 +49,11 @@ struct MakerWorldProvider: ModelProvider {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
               let html = String(data: data, encoding: .utf8) else {
-            throw JarvisError.profilePageFailed
+            throw ProviderError.profilePageFailed
         }
 
         guard let direct = Self.extract3MFURL(from: html, baseURL: profile.downloadURL) else {
-            throw JarvisError.noDownloadableProfile
+            throw ProviderError.noDownloadableProfile
         }
 
         var downloadRequest = URLRequest(url: direct)
@@ -61,7 +61,7 @@ struct MakerWorldProvider: ModelProvider {
         downloadRequest.timeoutInterval = 30
         let (fileData, fileResponse) = try await session.data(for: downloadRequest)
         guard let fileHTTP = fileResponse as? HTTPURLResponse, (200..<300).contains(fileHTTP.statusCode), !fileData.isEmpty else {
-            throw JarvisError.profileDownloadFailed
+            throw ProviderError.profileDownloadFailed
         }
 
         let suggested = Self.safeFilename(profile.name) + ".3mf"
@@ -119,8 +119,10 @@ struct MakerWorldProvider: ModelProvider {
 
     private static func titleNearModelURL(_ modelURL: String, in html: String) -> String? {
         guard let range = html.range(of: modelURL) else { return nil }
-        let start = html.index(range.lowerBound, offsetBy: -min(500, html.distance(from: html.startIndex, to: range.lowerBound)))
-        let end = html.index(range.upperBound, offsetBy: min(500, html.distance(from: range.upperBound, to: html.endIndex)))
+        let startDistance = min(500, html.distance(from: html.startIndex, to: range.lowerBound))
+        let endDistance = min(500, html.distance(from: range.upperBound, to: html.endIndex))
+        let start = html.index(range.lowerBound, offsetBy: -startDistance)
+        let end = html.index(range.upperBound, offsetBy: endDistance)
         let snippet = String(html[start..<end])
         let titlePatterns = [#"\"name\"\s*:\s*\"([^\"]{2,100})\""#, #"\"title\"\s*:\s*\"([^\"]{2,100})\""#]
         for pattern in titlePatterns {
@@ -136,5 +138,21 @@ struct MakerWorldProvider: ModelProvider {
     private static func safeFilename(_ value: String) -> String {
         let sanitized = value.replacingOccurrences(of: "[^A-Za-z0-9_-]", with: "_", options: .regularExpression)
         return sanitized.isEmpty ? "jarvis_download" : String(sanitized.prefix(80))
+    }
+
+    private enum ProviderError: LocalizedError {
+        case searchFailed
+        case profilePageFailed
+        case noDownloadableProfile
+        case profileDownloadFailed
+
+        var errorDescription: String? {
+            switch self {
+            case .searchFailed: return "MakerWorld search could not be reached."
+            case .profilePageFailed: return "Jarvis could not open the selected MakerWorld model page."
+            case .noDownloadableProfile: return "That MakerWorld result did not expose a downloadable 3MF to Jarvis."
+            case .profileDownloadFailed: return "The MakerWorld 3MF download failed."
+            }
+        }
     }
 }
