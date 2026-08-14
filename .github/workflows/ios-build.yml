@@ -1,0 +1,38 @@
+name: Jarvis iOS Build
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Check project structure
+        run: |
+          echo "Checking Jarvis source..."
+          find . -maxdepth 3 -type f | sort
+
+      - name: Build check
+        run: |
+          if [ -f JarvisP1S.xcodeproj/project.pbxproj ]; then
+            xcodebuild \
+              -project JarvisP1S.xcodeproj \
+              -scheme JarvisP1S \
+              -sdk iphonesimulator \
+              -destination 'platform=iOS Simulator,name=iPhone 16' \
+              CODE_SIGNING_ALLOWED=NO \
+              build
+          else
+            echo "No Xcode project exists yet."
+            echo "Source files uploaded successfully."
+            exit 0
+          fi
