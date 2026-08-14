@@ -1,17 +1,11 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject private var app: JarvisAppModel
     @State private var text = ""
-    @State private var showSetup = false
     @State private var host = UserDefaults.standard.string(forKey: "p1s.host") ?? ""
     @State private var serial = UserDefaults.standard.string(forKey: "p1s.serial") ?? ""
     @State private var accessCode = Keychain.get("p1s.accessCode") ?? ""
-
-    private var threeMFType: UTType {
-        UTType(filenameExtension: "3mf") ?? .data
-    }
 
     var body: some View {
         NavigationStack {
@@ -21,18 +15,13 @@ struct ContentView: View {
                     header
                     statusCard
                     messageList
+                    confirmationControls
                     controls
                 }
                 .padding()
             }
             .navigationBarHidden(true)
             .sheet(isPresented: $app.showSetup) { setupSheet }
-            .fileImporter(isPresented: $app.showFileImporter, allowedContentTypes: [threeMFType], allowsMultipleSelection: true) { result in
-                switch result {
-                case .success(let urls): urls.forEach { app.import3MF($0) }
-                case .failure(let error): app.messages.append(("File picker failed: \(error.localizedDescription)", false))
-                }
-            }
         }
         .preferredColorScheme(.dark)
     }
@@ -76,6 +65,7 @@ struct ContentView: View {
             Button("Status") { app.handle("status") }
                 .buttonStyle(.bordered)
                 .tint(.white)
+                .disabled(app.isBusy)
         }
         .padding()
         .background(.white.opacity(0.08))
@@ -102,26 +92,62 @@ struct ContentView: View {
                 }
             }
             .onChange(of: app.messages.count) { _, count in
-                withAnimation { proxy.scrollTo(count - 1, anchor: .bottom) }
+                if count > 0 {
+                    withAnimation { proxy.scrollTo(count - 1, anchor: .bottom) }
+                }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var confirmationControls: some View {
+        if let name = app.pendingPrintName {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Ready to print")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                Text(name)
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+
+                HStack {
+                    Button("Cancel") { app.cancelPendingPrint() }
+                        .buttonStyle(.bordered)
+                        .tint(.white)
+                    Button("Confirm Print") {
+                        Task { await app.confirmPendingPrint() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(app.isBusy)
+                }
+            }
+            .padding()
+            .background(.white.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 16))
         }
     }
 
     private var controls: some View {
         VStack(spacing: 10) {
             HStack {
-                Button {
-                    app.showFileImporter = true
-                } label: {
-                    Label("Import sliced 3MF", systemImage: "doc.badge.plus")
-                }
-                .buttonStyle(.bordered)
-                .tint(.white)
-
+                Text("Search online • confirm before printing")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
                 Button {
                     Task {
-                        if app.speech.isListening { app.speech.stop() }
-                        else { try? await app.speech.start() }
+                        if app.speech.isListening {
+                            let spoken = app.speech.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+                            app.speech.stop()
+                            if !spoken.isEmpty {
+                                app.speech.transcript = ""
+                                app.handle(spoken)
+                            }
+                        } else {
+                            app.speech.transcript = ""
+                            try? await app.speech.start()
+                        }
                     }
                 } label: {
                     Image(systemName: app.speech.isListening ? "mic.fill" : "mic")
@@ -132,7 +158,7 @@ struct ContentView: View {
             }
 
             HStack {
-                TextField("Tell Jarvis what to do…", text: $text)
+                TextField("Tell Jarvis what to print…", text: $text)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { sendText() }
                 Button("Send") { sendText() }
