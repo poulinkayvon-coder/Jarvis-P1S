@@ -28,6 +28,15 @@ final class JarvisAppModel: ObservableObject {
         Keychain.get("p1s.accessCode") != nil
     }
 
+    var makerWorldSignedIn: Bool {
+        guard let token = Keychain.get("bambu.cloudToken") else { return false }
+        return !token.isEmpty
+    }
+
+    var makerWorldAccount: String {
+        UserDefaults.standard.string(forKey: "bambu.account") ?? ""
+    }
+
     init() {
         rebuildPrinter()
         if !configured {
@@ -50,6 +59,24 @@ final class JarvisAppModel: ObservableObject {
         Task { await getStatus(showSuccessMessage: true) }
     }
 
+    func signInMakerWorld(account: String, password: String, verificationCode: String) async {
+        guard !isBusy else { return }
+        isBusy = true
+        defer { isBusy = false }
+
+        do {
+            let result = try await BambuCloudAuth.shared.login(
+                account: account,
+                password: password,
+                verificationCode: verificationCode
+            )
+            messages.append((result.message, false))
+            objectWillChange.send()
+        } catch {
+            messages.append(("MakerWorld sign-in failed: \(error.localizedDescription)", false))
+        }
+    }
+
     private func rebuildPrinter() {
         guard let host = UserDefaults.standard.string(forKey: "p1s.host"),
               let serial = UserDefaults.standard.string(forKey: "p1s.serial"),
@@ -67,16 +94,14 @@ final class JarvisAppModel: ObservableObject {
         messages.append((clean, true))
 
         if pendingPrint != nil {
-            let lower = clean.lowercased()
-            if ["yes", "yeah", "yep", "confirm", "do it", "print it", "start it"].contains(where: lower.contains) {
+            switch parser.parse(clean) {
+            case .confirmPrint:
                 Task { await confirmPendingPrint() }
-                return
-            }
-            if ["no", "nope", "cancel", "don't", "do not", "never mind", "nevermind"].contains(where: lower.contains) {
+            case .declinePrint, .cancel:
                 cancelPendingPrint()
-                return
+            default:
+                messages.append(("I found a print and I'm waiting for your confirmation. Say yes to print it or no to cancel.", false))
             }
-            messages.append(("I found a print and I'm waiting for your confirmation. Say yes to print it or no to cancel.", false))
             return
         }
 
@@ -93,8 +118,12 @@ final class JarvisAppModel: ObservableObject {
         case .cancel: Task { await printerAction("stop") { try await self.requirePrinter().cancel() } }
         case .findAndPrint(let query, let color, let slot):
             Task { await searchForPrint(query: query, color: color, slot: slot) }
+        case .confirmPrint:
+            messages.append(("There isn't a pending model to confirm. Tell me what you want to print first.", false))
+        case .declinePrint:
+            messages.append(("There isn't a pending print to cancel.", false))
         case .unknown:
-            messages.append(("Try “print a Benchy in red using slot 3.” I'll search online, show you what I found, and wait for your confirmation before printing.", false))
+            messages.append(("Try “print a Benchy in red using slot 3.” I'll search MakerWorld, show you what I found, and wait for your confirmation before printing.", false))
         }
     }
 
@@ -106,7 +135,7 @@ final class JarvisAppModel: ObservableObject {
         do {
             messages.append(("Confirmed. Downloading \(pending.candidate.name)…", false))
             let fileURL = try await modelProvider.download(profile: pending.candidate)
-            let chosenSlot = pending.requestedSlot ?? 1
+            let chosenSlot = pending.requestedSlot ?? bestCachedSlot(for: pending.requestedColor) ?? 1
             guard (1...4).contains(chosenSlot) else {
                 messages.append(("AMS slots are 1 through 4.", false))
                 clearPendingPrint()
@@ -174,6 +203,12 @@ final class JarvisAppModel: ObservableObject {
 
     private func searchForPrint(query: String, color: String?, slot: Int?) async {
         guard !isBusy else { return }
+        guard makerWorldSignedIn else {
+            messages.append(("Before I can download MakerWorld print profiles, connect your Bambu/MakerWorld account once in Setup. Your password is used only for the sign-in request; Jarvis stores the returned access token in the iPhone Keychain.", false))
+            showSetup = true
+            return
+        }
+
         isBusy = true
         defer { isBusy = false }
 
@@ -186,7 +221,7 @@ final class JarvisAppModel: ObservableObject {
                 material: "PLA"
             )
             guard let best = results.first else {
-                messages.append(("I couldn't find a usable MakerWorld result for “\(query)”. Try a more specific name.", false))
+                messages.append(("I couldn't find a usable P1S MakerWorld result for “\(query)”. Try a more specific name.", false))
                 return
             }
 
@@ -194,10 +229,16 @@ final class JarvisAppModel: ObservableObject {
             pendingPrintName = best.name
             let slotText = slot.map { " using AMS slot \($0)" } ?? ""
             let colorText = color.map { " in \($0)" } ?? ""
-            messages.append(("I found “\(best.name)” on MakerWorld\(colorText)\(slotText). I have NOT sent anything to the printer. Do you want me to download and print it?", false))
+            let details = best.notes.map { " \($0)." } ?? ""
+            messages.append(("I found “\(best.name)” on MakerWorld.\(details)\(colorText)\(slotText) I have NOT sent anything to the printer. Do you want me to download and print it?", false))
         } catch {
             messages.append(("Online model search failed: \(error.localizedDescription)", false))
         }
+    }
+
+    private func bestCachedSlot(for color: String?) -> Int? {
+        guard let requested = color?.lowercased() else { return nil }
+        return ams.filaments.first(where: { $0.colorName.lowercased() == requested })?.slot
     }
 
     private func printerAction(_ name: String, _ action: @escaping () async throws -> Void) async {
