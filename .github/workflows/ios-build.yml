@@ -15,13 +15,30 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
-      - name: Build Jarvis
+      - name: Build Jarvis for iPhone
         run: |
+          rm -rf build Payload JarvisP1S-unsigned.ipa
           xcodebuild \
             -project JarvisP1S.xcodeproj \
             -scheme JarvisP1S \
-            -sdk iphonesimulator \
-            -destination 'generic/platform=iOS Simulator' \
+            -sdk iphoneos \
+            -configuration Release \
+            CONFIGURATION_BUILD_DIR="$PWD/build/JarvisP1S" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             build
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/JarvisP1S/JarvisP1S.app Payload/JarvisP1S.app
+          /usr/bin/zip -qry JarvisP1S-unsigned.ipa Payload
+          ls -lh JarvisP1S-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JarvisP1S-unsigned-IPA
+          path: JarvisP1S-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
