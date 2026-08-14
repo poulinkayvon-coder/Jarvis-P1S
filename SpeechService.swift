@@ -1,6 +1,7 @@
 import Foundation
 import Speech
 import AVFoundation
+import Combine
 
 @MainActor
 final class SpeechService: NSObject, ObservableObject {
@@ -11,9 +12,18 @@ final class SpeechService: NSObject, ObservableObject {
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
 
     func start() async throws {
-        guard let recognizer, recognizer.isAvailable else { throw NSError(domain: "JarvisSpeech", code: 1) }
-        let auth = await SFSpeechRecognizer.requestAuthorization()
-        guard auth == .authorized else { throw NSError(domain: "JarvisSpeech", code: 2) }
+        guard let recognizer, recognizer.isAvailable else {
+            throw NSError(domain: "JarvisSpeech", code: 1, userInfo: [NSLocalizedDescriptionKey: "Speech recognition is unavailable."])
+        }
+
+        let authorization = await withCheckedContinuation { continuation in
+            SFSpeechRecognizer.requestAuthorization { status in
+                continuation.resume(returning: status)
+            }
+        }
+        guard authorization == .authorized else {
+            throw NSError(domain: "JarvisSpeech", code: 2, userInfo: [NSLocalizedDescriptionKey: "Speech recognition permission was not granted."])
+        }
 
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.record, mode: .measurement, options: .duckOthers)
@@ -21,6 +31,7 @@ final class SpeechService: NSObject, ObservableObject {
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
+
         let node = engine.inputNode
         node.removeTap(onBus: 0)
         node.installTap(onBus: 0, bufferSize: 1024, format: node.outputFormat(forBus: 0)) { buffer, _ in
@@ -33,7 +44,9 @@ final class SpeechService: NSObject, ObservableObject {
 
         recognizer.recognitionTask(with: request) { [weak self] result, _ in
             Task { @MainActor in
-                if let result { self?.transcript = result.bestTranscription.formattedString }
+                if let result {
+                    self?.transcript = result.bestTranscription.formattedString
+                }
             }
         }
     }
