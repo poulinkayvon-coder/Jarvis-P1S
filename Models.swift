@@ -53,6 +53,8 @@ struct FilamentMapping: Identifiable, Codable, Equatable {
 enum JarvisCommand: Equatable {
     case status
     case findAndPrint(query: String, requestedColor: String?, requestedSlot: Int?)
+    case confirmPrint
+    case declinePrint
     case pause
     case resume
     case cancel
