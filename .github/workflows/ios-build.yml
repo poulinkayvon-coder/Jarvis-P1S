@@ -1,9 +1,21 @@
 name: Jarvis iOS Build
 
+# Do not build every intermediate code commit. That created a notification storm
+# while Jarvis was being developed. Build the installable IPA only when:
+#   1) this workflow itself changes, or
+#   2) a version tag such as v0.2.0 is pushed, or
+#   3) the workflow is started manually from GitHub Actions.
 on:
   push:
-    branches: ["main"]
-  pull_request:
+    tags:
+      - "v*"
+    paths:
+      - ".github/workflows/ios-build.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: jarvis-ios-build
+  cancel-in-progress: true
 
 jobs:
   build:
