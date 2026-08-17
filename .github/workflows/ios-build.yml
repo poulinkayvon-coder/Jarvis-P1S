@@ -33,6 +33,7 @@ jobs:
           grep -F "ALWAYS LISTENING" ContentView.swift
           grep -F "FoundationModels" JarvisAppModel.swift
           grep -F "hey jarvis" SpeechService.swift
+          grep -F "KokoroSwift" SpeechService.swift
           grep -F "IPHONEOS_DEPLOYMENT_TARGET = 26.0" JarvisP1S.xcodeproj/project.pbxproj
 
       - name: Build Jarvis for iPhone from scratch
@@ -44,6 +45,7 @@ jobs:
             -sdk iphoneos \
             -configuration Release \
             -derivedDataPath "$PWD/DerivedData" \
+            -skipPackagePluginValidation \
             CONFIGURATION_BUILD_DIR="$PWD/build/JarvisP1S" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
@@ -55,7 +57,7 @@ jobs:
           strings build/JarvisP1S/JarvisP1S.app/JarvisP1S > compiled-strings.txt
           grep -F "ALWAYS LISTENING" compiled-strings.txt
           grep -F "Hey Jarvis" compiled-strings.txt
-          echo "Verified: compiled Jarvis contains the HUD and wake phrase. Foundation Models integration was verified in source before compilation."
+          echo "Verified: compiled Jarvis contains the HUD and wake phrase. Foundation Models and Kokoro integration were verified in source before compilation."
 
       - name: Package and verify unsigned IPA
         run: |
