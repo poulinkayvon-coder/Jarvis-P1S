@@ -18,7 +18,10 @@ concurrency:
 
 jobs:
   build:
-    runs-on: xcode-27
+    # Xcode 27 GitHub preview runners currently have a known Metal Toolchain
+    # mounting problem. FoundationModels only requires iOS 26+, so build on
+    # the stable macOS 26 / Xcode 26 line instead.
+    runs-on: macos-26
     steps:
       - name: Checkout current commit
         uses: actions/checkout@v4
@@ -26,34 +29,58 @@ jobs:
           fetch-depth: 1
           clean: true
 
-      - name: Show source and Xcode version
+      - name: Select stable Xcode 26
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Show source and verify project
         run: |
           echo "Building commit: $GITHUB_SHA"
-          xcodebuild -version
           grep -F "ALWAYS LISTENING" ContentView.swift
           grep -F "FoundationModels" JarvisAppModel.swift
           grep -F "hey jarvis" SpeechService.swift
           grep -F "KokoroSwift" SpeechService.swift
           grep -F "IPHONEOS_DEPLOYMENT_TARGET = 26.0" JarvisP1S.xcodeproj/project.pbxproj
 
-      - name: Install Metal toolchain for MLX
+      - name: Ensure Metal toolchain is available for MLX
         run: |
-          sudo xcodebuild -downloadComponent MetalToolchain
+          set -euxo pipefail
+          if ! xcodebuild -showComponent MetalToolchain; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcodebuild -showComponent MetalToolchain
+          xcrun -f metal
+          metal_path="$(xcrun -f metal)"
+          test -x "$metal_path"
+          "$metal_path" --version || true
+
+      - name: Resolve Swift packages
+        run: |
+          rm -rf DerivedData
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project JarvisP1S.xcodeproj \
+            -scheme JarvisP1S \
+            -derivedDataPath "$PWD/DerivedData" \
+            -skipPackagePluginValidation
 
       - name: Build Jarvis for iPhone from scratch
         run: |
-          rm -rf build Payload DerivedData JarvisP1S-unsigned.ipa
+          set -o pipefail
+          rm -rf build Payload JarvisP1S-unsigned.ipa
           xcodebuild \
             -project JarvisP1S.xcodeproj \
             -scheme JarvisP1S \
-            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -configuration Release \
             -derivedDataPath "$PWD/DerivedData" \
             -skipPackagePluginValidation \
             CONFIGURATION_BUILD_DIR="$PWD/build/JarvisP1S" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            clean build
+            clean build | tee xcodebuild.log
 
       - name: Verify compiled app is current
         run: |
@@ -61,14 +88,15 @@ jobs:
           strings build/JarvisP1S/JarvisP1S.app/JarvisP1S > compiled-strings.txt
           grep -F "ALWAYS LISTENING" compiled-strings.txt
           grep -F "Hey Jarvis" compiled-strings.txt
-          echo "Verified: compiled Jarvis contains the HUD and wake phrase. Foundation Models and Kokoro integration were verified in source before compilation."
+          test -d build/JarvisP1S/JarvisP1S.app
+          echo "Verified: current Jarvis HUD and wake phrase are present in the compiled app. FoundationModels and Kokoro were verified in source and successfully linked by the build."
 
       - name: Package and verify unsigned IPA
         run: |
+          rm -rf Payload verify-ipa
           mkdir -p Payload
           cp -R build/JarvisP1S/JarvisP1S.app Payload/JarvisP1S.app
           /usr/bin/zip -qry JarvisP1S-unsigned.ipa Payload
-          rm -rf verify-ipa
           mkdir verify-ipa
           ditto -x -k JarvisP1S-unsigned.ipa verify-ipa
           test -f verify-ipa/Payload/JarvisP1S.app/JarvisP1S
