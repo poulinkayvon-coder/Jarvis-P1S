@@ -1,6 +1,6 @@
 import Foundation
 import Speech
-import AVFoundation
+@preconcurrency import AVFoundation
 import Combine
 
 @MainActor
