@@ -18,9 +18,6 @@ concurrency:
 
 jobs:
   build:
-    # Xcode 27 GitHub preview runners currently have a known Metal Toolchain
-    # mounting problem. FoundationModels only requires iOS 26+, so build on
-    # the stable macOS 26 / Xcode 26 line instead.
     runs-on: macos-26
     steps:
       - name: Checkout current commit
@@ -43,6 +40,7 @@ jobs:
           grep -F "hey jarvis" SpeechService.swift
           grep -F "KokoroSwift" SpeechService.swift
           grep -F "IPHONEOS_DEPLOYMENT_TARGET = 26.0" JarvisP1S.xcodeproj/project.pbxproj
+          grep -F 'LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"' JarvisP1S.xcodeproj/project.pbxproj
 
       - name: Ensure Metal toolchain is available for MLX
         run: |
@@ -82,27 +80,42 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             clean build | tee xcodebuild.log
 
-      - name: Verify compiled app is current
+      - name: Verify compiled app is launchable
         run: |
-          test -f build/JarvisP1S/JarvisP1S.app/JarvisP1S
-          strings build/JarvisP1S/JarvisP1S.app/JarvisP1S > compiled-strings.txt
+          set -euxo pipefail
+          APP="build/JarvisP1S/JarvisP1S.app"
+          BIN="$APP/JarvisP1S"
+          test -f "$BIN"
+          test -d "$APP/Frameworks/KokoroSwift.framework"
+          test -f "$APP/Frameworks/KokoroSwift.framework/KokoroSwift"
+          strings "$BIN" > compiled-strings.txt
           grep -F "ALWAYS LISTENING" compiled-strings.txt
           grep -F "Hey Jarvis" compiled-strings.txt
-          test -d build/JarvisP1S/JarvisP1S.app
-          echo "Verified: current Jarvis HUD and wake phrase are present in the compiled app. FoundationModels and Kokoro were verified in source and successfully linked by the build."
+          otool -L "$BIN"
+          otool -l "$BIN" > load-commands.txt
+          grep -A3 LC_RPATH load-commands.txt | grep -F '@executable_path/Frameworks'
+          otool -L "$BIN" | grep -F '@rpath/KokoroSwift.framework/KokoroSwift'
+          echo "Verified: HUD/wake code is current, Kokoro is embedded, and the executable has the Frameworks runtime search path required by dyld."
 
       - name: Package and verify unsigned IPA
         run: |
+          set -euxo pipefail
           rm -rf Payload verify-ipa
           mkdir -p Payload
           cp -R build/JarvisP1S/JarvisP1S.app Payload/JarvisP1S.app
           /usr/bin/zip -qry JarvisP1S-unsigned.ipa Payload
           mkdir verify-ipa
           ditto -x -k JarvisP1S-unsigned.ipa verify-ipa
-          test -f verify-ipa/Payload/JarvisP1S.app/JarvisP1S
-          strings verify-ipa/Payload/JarvisP1S.app/JarvisP1S > ipa-strings.txt
+          APP="verify-ipa/Payload/JarvisP1S.app"
+          BIN="$APP/JarvisP1S"
+          test -f "$BIN"
+          test -f "$APP/Frameworks/KokoroSwift.framework/KokoroSwift"
+          strings "$BIN" > ipa-strings.txt
           grep -F "ALWAYS LISTENING" ipa-strings.txt
           grep -F "Hey Jarvis" ipa-strings.txt
+          otool -l "$BIN" > ipa-load-commands.txt
+          grep -A3 LC_RPATH ipa-load-commands.txt | grep -F '@executable_path/Frameworks'
+          otool -L "$BIN" | grep -F '@rpath/KokoroSwift.framework/KokoroSwift'
           shasum -a 256 JarvisP1S-unsigned.ipa
           ls -lh JarvisP1S-unsigned.ipa
 
