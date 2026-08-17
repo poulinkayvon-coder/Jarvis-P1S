@@ -38,11 +38,25 @@ final class JarvisAppModel: ObservableObject {
     }
 
     init() {
+        speech.onCommand = { [weak self] command in
+            self?.handle(command)
+        }
+
         rebuildPrinter()
+
         if !configured {
             showSetup = true
         } else {
             Task { await getStatus(showSuccessMessage: false) }
+        }
+
+        Task {
+            do {
+                try await speech.startAlwaysListening()
+                messages.append(("Wake phrase armed. Say “Hey Jarvis” whenever you need me.", false))
+            } catch {
+                messages.append(("Voice wake-up is unavailable: \(error.localizedDescription). You can still type commands.", false))
+            }
         }
     }
 
