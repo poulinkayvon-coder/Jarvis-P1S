@@ -1,14 +1,11 @@
 name: Jarvis iOS Build
 
-# Do not build every intermediate code commit. That created a notification storm
-# while Jarvis was being developed. Build the installable IPA only when:
-#   1) this workflow itself changes, or
-#   2) a version tag such as v0.2.0 is pushed, or
-#   3) the workflow is started manually from GitHub Actions.
+# Build only when this workflow changes on the Jarvis HUD branch,
+# or when started manually. This avoids the old notification storm.
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - "jarvis-hud-ui"
     paths:
       - ".github/workflows/ios-build.yml"
   workflow_dispatch:
@@ -19,7 +16,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-15-intel
+    runs-on: xcode-27
     steps:
       - name: Checkout current commit
         uses: actions/checkout@v4
@@ -31,11 +28,9 @@ jobs:
         run: |
           echo "Building commit: $GITHUB_SHA"
           xcodebuild -version
-          grep -F "MakerWorld search" ContentView.swift
-          if grep -Fq "Import sliced 3MF" ContentView.swift; then
-            echo "ERROR: checkout contains the old UI source"
-            exit 1
-          fi
+          grep -F "ALWAYS LISTENING" ContentView.swift
+          grep -F "FoundationModels" JarvisAppModel.swift
+          grep -F "hey jarvis" SpeechService.swift
 
       - name: Build Jarvis for iPhone from scratch
         run: |
@@ -55,12 +50,10 @@ jobs:
         run: |
           test -f build/JarvisP1S/JarvisP1S.app/JarvisP1S
           strings build/JarvisP1S/JarvisP1S.app/JarvisP1S > compiled-strings.txt
-          grep -F "MakerWorld search" compiled-strings.txt
-          if grep -Fq "Import sliced 3MF" compiled-strings.txt; then
-            echo "ERROR: compiled app still contains the old Import sliced 3MF UI"
-            exit 1
-          fi
-          echo "Verified: compiled binary contains current MakerWorld UI and not the old import UI."
+          grep -F "ALWAYS LISTENING" compiled-strings.txt
+          grep -F "Hey Jarvis" compiled-strings.txt
+          grep -F "ON-DEVICE AI" compiled-strings.txt
+          echo "Verified: compiled Jarvis contains the wake phrase, HUD, and on-device AI integration."
 
       - name: Package and verify unsigned IPA
         run: |
@@ -71,18 +64,14 @@ jobs:
           mkdir verify-ipa
           ditto -x -k JarvisP1S-unsigned.ipa verify-ipa
           strings verify-ipa/Payload/JarvisP1S.app/JarvisP1S > ipa-strings.txt
-          grep -F "MakerWorld search" ipa-strings.txt
-          if grep -Fq "Import sliced 3MF" ipa-strings.txt; then
-            echo "ERROR: packaged IPA contains old UI"
-            exit 1
-          fi
+          grep -F "ALWAYS LISTENING" ipa-strings.txt
           shasum -a 256 JarvisP1S-unsigned.ipa
           ls -lh JarvisP1S-unsigned.ipa
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: JarvisP1S-current-unsigned-IPA
+          name: Jarvis-HUD-unsigned-IPA
           path: JarvisP1S-unsigned.ipa
           if-no-files-found: error
           retention-days: 7
