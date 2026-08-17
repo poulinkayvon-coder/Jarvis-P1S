@@ -1,12 +1,14 @@
 name: Jarvis iOS Build
 
-# Build only when this workflow changes on the Jarvis HUD branch,
-# or when started manually. This avoids the old notification storm.
+# Build the Jarvis HUD branch when app source or this workflow changes,
+# or when started manually.
 on:
   push:
     branches:
       - "jarvis-hud-ui"
     paths:
+      - "*.swift"
+      - "JarvisP1S.xcodeproj/**"
       - ".github/workflows/ios-build.yml"
   workflow_dispatch:
 
@@ -31,6 +33,7 @@ jobs:
           grep -F "ALWAYS LISTENING" ContentView.swift
           grep -F "FoundationModels" JarvisAppModel.swift
           grep -F "hey jarvis" SpeechService.swift
+          grep -F "IPHONEOS_DEPLOYMENT_TARGET = 26.0" JarvisP1S.xcodeproj/project.pbxproj
 
       - name: Build Jarvis for iPhone from scratch
         run: |
