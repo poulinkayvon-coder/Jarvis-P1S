@@ -36,6 +36,10 @@ jobs:
           grep -F "KokoroSwift" SpeechService.swift
           grep -F "IPHONEOS_DEPLOYMENT_TARGET = 26.0" JarvisP1S.xcodeproj/project.pbxproj
 
+      - name: Install Metal toolchain for MLX
+        run: |
+          sudo xcodebuild -downloadComponent MetalToolchain
+
       - name: Build Jarvis for iPhone from scratch
         run: |
           rm -rf build Payload DerivedData JarvisP1S-unsigned.ipa
