@@ -42,6 +42,7 @@ struct ContentView: View {
         .onAppear {
             pulse = true
             rotation = 360
+            app.startVoiceLinkIfNeeded()
         }
     }
 
@@ -78,7 +79,7 @@ struct ContentView: View {
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(cyan)
                         .padding(10)
-                        .background(Color.black.opacity(0.7))
+                        .background(Color.black.opacity(0.72))
                         .overlay(Circle().stroke(cyan.opacity(0.5), lineWidth: 1))
                 }
                 .position(x: geo.size.width - 29, y: geo.size.height - 28)
@@ -105,18 +106,21 @@ struct ContentView: View {
                 .frame(width: 132, height: 1)
                 .shadow(color: cyan, radius: 4)
 
-            Text(app.speech.isListening ? "VOICE LINK ACTIVE" : "VOICE ASSISTANT")
+            Text("VOICE ASSISTANT")
                 .font(.system(size: 8, weight: .medium, design: .monospaced))
                 .tracking(2.2)
                 .foregroundStyle(.white.opacity(0.55))
 
             HStack(spacing: 6) {
                 Circle()
-                    .fill(app.speech.isListening ? cyan : .white.opacity(0.3))
+                    .fill(app.speech.isListening ? cyan : Color.orange)
                     .frame(width: 5, height: 5)
-                Text(app.speech.isListening ? "LISTENING" : "STANDBY")
-                    .font(.system(size: 7, design: .monospaced))
-                    .foregroundStyle(cyan.opacity(0.85))
+                    .shadow(color: app.speech.isListening ? cyan : .orange, radius: 4)
+                Text(app.speech.statusText)
+                    .font(.system(size: 6.5, weight: .medium, design: .monospaced))
+                    .foregroundStyle(app.speech.isListening ? cyan.opacity(0.9) : .orange)
+                    .lineLimit(2)
+                    .frame(width: 135, alignment: .leading)
             }
             .padding(.top, 5)
         }
@@ -130,18 +134,19 @@ struct ContentView: View {
                     .foregroundStyle(cyan)
                 Spacer()
                 Circle()
-                    .fill(app.configured ? Color.green : Color.orange)
+                    .fill(Color.green)
                     .frame(width: 5, height: 5)
             }
 
             hudStatusRow("POWER CORE", "100%")
-            hudStatusRow("SYSTEMS", app.configured ? "ONLINE" : "SETUP")
-            hudStatusRow("NETWORK", app.status.state.rawValue.uppercased())
-            hudStatusRow("VOICE", app.speech.isListening ? "ACTIVE" : "READY")
+            hudStatusRow("AI CORE", app.brainStatus)
+            hudStatusRow("MEMORY", "\(app.memoryCount) ITEMS")
+            hudStatusRow("P1S LINK", app.configured ? "READY" : "SETUP")
+            hudStatusRow("VOICE", app.speech.isSpeaking ? "SPEAKING" : (app.speech.isListening ? "ACTIVE" : "OFFLINE"))
         }
         .padding(9)
-        .frame(width: 124)
-        .background(Color.black.opacity(0.5))
+        .frame(width: 134)
+        .background(Color.black.opacity(0.55))
         .overlay(
             RoundedRectangle(cornerRadius: 2)
                 .stroke(cyan.opacity(0.35), lineWidth: 0.8)
@@ -149,59 +154,54 @@ struct ContentView: View {
     }
 
     private func hudStatusRow(_ label: String, _ value: String) -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 5) {
             Text(label)
-                .font(.system(size: 6, design: .monospaced))
+                .font(.system(size: 5.7, design: .monospaced))
                 .foregroundStyle(.white.opacity(0.5))
             Spacer()
             Text(value)
-                .font(.system(size: 6, weight: .semibold, design: .monospaced))
+                .font(.system(size: 5.7, weight: .semibold, design: .monospaced))
                 .foregroundStyle(cyan.opacity(0.9))
                 .lineLimit(1)
         }
     }
 
     private var coreOrb: some View {
-        Button {
-            toggleVoice()
-        } label: {
-            ZStack {
-                ForEach(0..<5, id: \.self) { index in
-                    Circle()
-                        .trim(from: Double(index) * 0.11, to: min(Double(index) * 0.11 + 0.46, 1))
-                        .stroke(cyan.opacity(0.22 + Double(index) * 0.07), lineWidth: index == 0 ? 1.3 : 0.7)
-                        .frame(width: 168 - CGFloat(index * 22), height: 168 - CGFloat(index * 22))
-                        .rotationEffect(.degrees(rotation * (index.isMultiple(of: 2) ? 1 : -1) + Double(index * 23)))
-                }
-
+        ZStack {
+            ForEach(0..<5, id: \.self) { index in
                 Circle()
-                    .stroke(cyan.opacity(0.3), lineWidth: 1)
-                    .frame(width: 76, height: 76)
-                    .scaleEffect(pulse ? 1.13 : 0.94)
-                    .opacity(pulse ? 0.18 : 0.6)
-
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [.white, cyan, deepCyan, .black],
-                            center: .center,
-                            startRadius: 1,
-                            endRadius: 38
-                        )
-                    )
-                    .frame(width: 57, height: 57)
-                    .shadow(color: cyan, radius: app.speech.isListening ? 22 : 12)
-
-                Circle()
-                    .fill(Color.white.opacity(0.95))
-                    .frame(width: 14, height: 14)
-                    .blur(radius: 1.3)
+                    .trim(from: Double(index) * 0.11, to: min(Double(index) * 0.11 + 0.46, 1))
+                    .stroke(cyan.opacity(0.22 + Double(index) * 0.07), lineWidth: index == 0 ? 1.3 : 0.7)
+                    .frame(width: 168 - CGFloat(index * 22), height: 168 - CGFloat(index * 22))
+                    .rotationEffect(.degrees(rotation * (index.isMultiple(of: 2) ? 1 : -1) + Double(index * 23)))
             }
+
+            Circle()
+                .stroke(cyan.opacity(0.3), lineWidth: 1)
+                .frame(width: 76, height: 76)
+                .scaleEffect(pulse ? 1.13 : 0.94)
+                .opacity(pulse ? 0.18 : 0.6)
+
+            Circle()
+                .fill(
+                    RadialGradient(
+                        colors: [.white, cyan, deepCyan, .black],
+                        center: .center,
+                        startRadius: 1,
+                        endRadius: 38
+                    )
+                )
+                .frame(width: 57, height: 57)
+                .shadow(color: cyan, radius: app.speech.isAwake || app.speech.isSpeaking ? 26 : 14)
+
+            Circle()
+                .fill(Color.white.opacity(0.96))
+                .frame(width: 14, height: 14)
+                .blur(radius: 1.3)
         }
-        .buttonStyle(.plain)
         .animation(.linear(duration: 18).repeatForever(autoreverses: false), value: rotation)
-        .animation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true), value: pulse)
-        .accessibilityLabel(app.speech.isListening ? "Stop listening" : "Start listening")
+        .animation(.easeInOut(duration: 1.35).repeatForever(autoreverses: true), value: pulse)
+        .accessibilityLabel("Jarvis voice core")
     }
 
     private var bottomTelemetry: some View {
@@ -224,10 +224,10 @@ struct ContentView: View {
             Spacer()
 
             HStack(spacing: 5) {
-                Text(app.configured ? "CONNECTED" : "OFFLINE")
-                    .font(.system(size: 7, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(app.configured ? cyan : .orange)
-                Image(systemName: "wifi")
+                Text(app.speech.isAwake ? "AWAKE" : "MONITORING")
+                    .font(.system(size: 6.5, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(cyan)
+                Image(systemName: "waveform")
                     .font(.system(size: 9))
                     .foregroundStyle(cyan.opacity(0.8))
             }
@@ -238,9 +238,9 @@ struct ContentView: View {
         HStack(alignment: .center, spacing: 2) {
             ForEach(0..<23, id: \.self) { i in
                 Capsule()
-                    .fill(cyan.opacity(app.speech.isListening ? 0.9 : 0.35))
+                    .fill(cyan.opacity(app.speech.isListening ? 0.9 : 0.3))
                     .frame(width: 2, height: CGFloat(4 + ((i * 7) % 18)))
-                    .scaleEffect(y: app.speech.isListening && pulse ? 1.35 : 0.75)
+                    .scaleEffect(y: app.speech.isAwake && pulse ? 1.45 : (app.speech.isListening ? 0.9 : 0.55))
             }
         }
         .animation(.easeInOut(duration: 0.45).repeatForever(autoreverses: true), value: pulse)
@@ -279,11 +279,7 @@ struct ContentView: View {
                                 .foregroundStyle(message.1 ? .white : cyan.opacity(0.95))
                                 .padding(.horizontal, 13)
                                 .padding(.vertical, 10)
-                                .background(
-                                    message.1
-                                        ? Color.white.opacity(0.08)
-                                        : deepCyan.opacity(0.15)
-                                )
+                                .background(message.1 ? Color.white.opacity(0.08) : deepCyan.opacity(0.15))
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 12)
                                         .stroke(message.1 ? Color.white.opacity(0.12) : cyan.opacity(0.22), lineWidth: 0.7)
@@ -347,9 +343,26 @@ struct ContentView: View {
 
     private var commandBar: some View {
         VStack(spacing: 7) {
-            if app.speech.isListening && !app.speech.transcript.isEmpty {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(app.speech.isListening ? cyan : Color.orange)
+                    .frame(width: 6, height: 6)
+                Text(app.speech.isListening ? "ALWAYS LISTENING • SAY “HEY JARVIS”" : "VOICE LINK OFFLINE")
+                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(app.speech.isListening ? cyan.opacity(0.8) : .orange)
+                Spacer()
+
+                if !app.speech.isListening && !app.speech.isSpeaking {
+                    Button("RECONNECT") { app.startVoiceLinkIfNeeded() }
+                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                        .foregroundStyle(cyan)
+                }
+            }
+            .padding(.horizontal, 14)
+
+            if app.speech.isAwake && !app.speech.transcript.isEmpty {
                 Text(app.speech.transcript)
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(cyan.opacity(0.75))
                     .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -357,15 +370,7 @@ struct ContentView: View {
             }
 
             HStack(spacing: 9) {
-                Button { toggleVoice() } label: {
-                    Image(systemName: app.speech.isListening ? "waveform.circle.fill" : "mic.circle")
-                        .font(.system(size: 30))
-                        .foregroundStyle(cyan)
-                        .shadow(color: cyan.opacity(0.45), radius: app.speech.isListening ? 7 : 0)
-                }
-                .buttonStyle(.plain)
-
-                TextField("Ask Jarvis anything…", text: $text)
+                TextField("Optional: type to Jarvis…", text: $text)
                     .textInputAutocapitalization(.sentences)
                     .foregroundStyle(.white)
                     .tint(cyan)
@@ -388,22 +393,6 @@ struct ContentView: View {
         .background(Color.black)
     }
 
-    private func toggleVoice() {
-        Task {
-            if app.speech.isListening {
-                let spoken = app.speech.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-                app.speech.stop()
-                if !spoken.isEmpty {
-                    app.speech.transcript = ""
-                    app.handle(spoken)
-                }
-            } else {
-                app.speech.transcript = ""
-                try? await app.speech.start()
-            }
-        }
-    }
-
     private func sendText() {
         let command = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !command.isEmpty else { return }
@@ -423,6 +412,24 @@ struct ContentView: View {
     private var setupSheet: some View {
         NavigationStack {
             Form {
+                Section("Jarvis voice link") {
+                    HStack {
+                        Text("Wake phrase")
+                        Spacer()
+                        Text("Hey Jarvis")
+                            .foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Text("Status")
+                        Spacer()
+                        Text(app.speech.isListening ? "Active" : "Offline")
+                            .foregroundStyle(app.speech.isListening ? .green : .orange)
+                    }
+                    Text("Jarvis listens for the wake phrase while the app is running. The text box on the main screen is only a backup.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("P1S local connection") {
                     TextField("Printer IP address", text: $host)
                         .textInputAutocapitalization(.never)
@@ -464,14 +471,28 @@ struct ContentView: View {
                         }
                     }
                     .disabled(bambuAccount.isEmpty || (bambuPassword.isEmpty && bambuVerificationCode.isEmpty) || app.isBusy)
+                }
 
-                    Text("Jarvis sends these credentials only to Bambu Lab's sign-in API. Your password is not saved. If sign-in succeeds, only the returned access token is stored in the iPhone Keychain.")
+                Section("Intelligence") {
+                    HStack {
+                        Text("AI core")
+                        Spacer()
+                        Text(app.brainStatus)
+                            .foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Text("Saved memories")
+                        Spacer()
+                        Text("\(app.memoryCount)")
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("On supported iPhones, Jarvis uses Apple's on-device Foundation Models when available, so normal conversation can stay on the phone without a paid AI API.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
 
                 Section {
-                    Text("Jarvis talks to the P1S directly over your local network. A MakerWorld profile is never sent to the printer until you explicitly confirm it.")
+                    Text("Jarvis talks to the P1S over your local network. A MakerWorld profile is never sent to the printer until you explicitly confirm it.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
