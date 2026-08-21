@@ -22,6 +22,7 @@ final class JarvisAppModel: ObservableObject {
     private var printer: PrinterTransport?
     private var pendingPrint: PendingPrint?
     private var memories: [String] = []
+    private var didStartVoiceLink = false
 
     private struct PendingPrint {
         let candidate: ModelCandidate
@@ -30,9 +31,12 @@ final class JarvisAppModel: ObservableObject {
     }
 
     var configured: Bool {
-        UserDefaults.standard.string(forKey: "p1s.host") != nil &&
-        UserDefaults.standard.string(forKey: "p1s.serial") != nil &&
-        Keychain.get("p1s.accessCode") != nil
+        guard let host = UserDefaults.standard.string(forKey: "p1s.host"),
+              let serial = UserDefaults.standard.string(forKey: "p1s.serial"),
+              let code = Keychain.get("p1s.accessCode") else { return false }
+        return !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+               !serial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+               !code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var makerWorldSignedIn: Bool {
@@ -60,24 +64,20 @@ final class JarvisAppModel: ObservableObject {
         } else {
             Task { await getStatus(showSuccessMessage: false) }
         }
-
-        Task {
-            do {
-                try await speech.startAlwaysListening()
-                reply("Voice link active. Say “Hey Jarvis” whenever you need me.", speak: false)
-            } catch {
-                reply("Voice wake-up is unavailable: \(error.localizedDescription). You can still type commands.", speak: false)
-            }
-        }
     }
 
     func startVoiceLinkIfNeeded() {
-        guard !speech.isListening && !speech.isSpeaking else { return }
-        Task {
+        guard !didStartVoiceLink else { return }
+        didStartVoiceLink = true
+        Task { [weak self] in
+            guard let self else { return }
             do {
-                try await speech.startAlwaysListening()
+                try await self.speech.startAlwaysListening()
+                self.reply("Voice link active. Say “Hey Jarvis” whenever you need me.", speak: false)
+                self.speech.prepareNaturalVoice()
             } catch {
-                reply("I couldn't start the voice link: \(error.localizedDescription)", speak: false)
+                self.didStartVoiceLink = false
+                self.reply("Voice wake-up is unavailable: \(error.localizedDescription). You can still type commands.", speak: false)
             }
         }
     }
@@ -91,6 +91,7 @@ final class JarvisAppModel: ObservableObject {
         Keychain.set(cleanCode, for: "p1s.accessCode")
         rebuildPrinter()
         status = PrinterStatus()
+        ams = AMSState()
         reply("P1S connection saved. Testing the local connection…", speak: false)
         Task { await getStatus(showSuccessMessage: true) }
     }
@@ -237,7 +238,21 @@ final class JarvisAppModel: ObservableObject {
         do {
             reply("Confirmed. Downloading \(pending.candidate.name)…", speak: false)
             let fileURL = try await modelProvider.download(profile: pending.candidate)
-            let chosenSlot = pending.requestedSlot ?? bestCachedSlot(for: pending.requestedColor) ?? 1
+
+            let chosenSlot: Int
+            if let requestedSlot = pending.requestedSlot {
+                chosenSlot = requestedSlot
+            } else if let color = pending.requestedColor {
+                if let cached = bestCachedSlot(for: color) {
+                    chosenSlot = cached
+                } else {
+                    await refreshAMSState()
+                    chosenSlot = bestCachedSlot(for: color) ?? 1
+                }
+            } else {
+                chosenSlot = 1
+            }
+
             guard (1...4).contains(chosenSlot) else {
                 reply("AMS slots are one through four.")
                 clearPendingPrint()
@@ -294,6 +309,7 @@ final class JarvisAppModel: ObservableObject {
             let probe = P1SStatusProbe(host: host, serial: serial, accessCode: code)
             let newStatus = try await probe.fetchStatus()
             status = newStatus
+            await refreshAMSState()
             if showSuccessMessage {
                 let job = newStatus.jobName.map { " Current job: \($0)." } ?? ""
                 reply("P1S is \(newStatus.state.rawValue). \(Int(newStatus.progress)) percent complete.\(job)")
@@ -301,6 +317,15 @@ final class JarvisAppModel: ObservableObject {
         } catch {
             status = PrinterStatus(state: .offline, errorMessage: error.localizedDescription)
             reply("I can't reach the P1S right now: \(error.localizedDescription)")
+        }
+    }
+
+    private func refreshAMSState() async {
+        guard let printer else { return }
+        do {
+            ams = try await printer.amsState()
+        } catch {
+            // AMS data is helpful for color selection but should not make printer status fail.
         }
     }
 
