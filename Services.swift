@@ -151,9 +151,14 @@ actor BambuP1STransport: PrinterTransport {
 
         let remote = Self.safeRemoteName(displayName)
         let ftp = try await FTPSClient(host: host, username: "bblp", password: accessCode)
-        try await ftp.connect()
-        try await ftp.upload(fileURL: fileURL, remoteName: remote)
-        await ftp.close()
+        do {
+            try await ftp.connect()
+            try await ftp.upload(fileURL: fileURL, remoteName: remote)
+            await ftp.close()
+        } catch {
+            await ftp.close()
+            throw error
+        }
 
         let mqtt = try await MQTTConnection(host: host, username: "bblp", password: accessCode, clientID: "jarvis-print-\(UUID().uuidString)")
         try await mqtt.connect()
@@ -250,7 +255,6 @@ private actor MQTTConnection {
     private let clientID: String
     private var connection: NWConnection?
     private var buffer = Data()
-    private var connected = false
     private var packetID: UInt16 = 1
 
     init(host: String, username: String, password: String, clientID: String) {
@@ -264,19 +268,7 @@ private actor MQTTConnection {
         let params = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
         let c = NWConnection(host: NWEndpoint.Host(host), port: 8883, using: params)
         connection = c
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            var finished = false
-            c.stateUpdateHandler = { state in
-                guard !finished else { return }
-                switch state {
-                case .ready: finished = true; cont.resume()
-                case .failed(let error): finished = true; cont.resume(throwing: error)
-                case .cancelled: finished = true; cont.resume(throwing: JarvisError.connectionClosed)
-                default: break
-                }
-            }
-            c.start(queue: DispatchQueue(label: "jarvis.mqtt"))
-        }
+        try await waitUntilReady(c, timeout: 7)
 
         var body = Data()
         body.appendMQTTString("MQTT")
@@ -287,8 +279,11 @@ private actor MQTTConnection {
         body.appendMQTTString(username)
         body.appendMQTTString(password)
         try await send(packet: Data([0x10]) + MQTTConnection.remainingLength(body.count) + body)
-        _ = try await receivePacket(timeout: 5)
-        connected = true
+
+        guard let connack = try await receivePacket(timeout: 5), connack.count >= 4, connack[0] >> 4 == 2 else {
+            throw JarvisError.timeout
+        }
+        guard connack[3] == 0 else { throw JarvisError.authenticationFailed(Int(connack[3])) }
     }
 
     func subscribe(topic: String) async throws {
@@ -296,7 +291,10 @@ private actor MQTTConnection {
         var body = Data([UInt8(id >> 8), UInt8(id & 0xff)])
         body.appendMQTTString(topic); body.append(0)
         try await send(packet: Data([0x82]) + MQTTConnection.remainingLength(body.count) + body)
-        _ = try await receivePacket(timeout: 5)
+        guard let ack = try await receivePacket(timeout: 5), ack.count >= 5, ack[0] >> 4 == 9 else {
+            throw JarvisError.timeout
+        }
+        guard ack.last != 0x80 else { throw JarvisError.subscriptionRejected }
     }
 
     func publish(topic: String, payload: Data) async throws {
@@ -314,15 +312,35 @@ private actor MQTTConnection {
         index += used
         guard remaining >= 2, index + 2 <= packet.count else { return nil }
         let topicLength = Int(packet[index]) << 8 | Int(packet[index + 1]); index += 2
+        guard index + topicLength <= packet.count else { return nil }
         index += topicLength
-        if (packet[0] & 0x06) != 0 { index += 2 }
+        if (packet[0] & 0x06) != 0 {
+            guard index + 2 <= packet.count else { return nil }
+            index += 2
+        }
         guard index <= packet.count else { return nil }
         return Data(packet[index...])
     }
 
     func close() {
-        connected = false
+        connection?.stateUpdateHandler = nil
         connection?.cancel(); connection = nil
+    }
+
+    private func waitUntilReady(_ c: NWConnection, timeout: TimeInterval) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let gate = TransportContinuationGate<Void>(continuation)
+            c.stateUpdateHandler = { state in
+                switch state {
+                case .ready: gate.succeed(())
+                case .failed(let error): gate.fail(error)
+                case .cancelled: gate.fail(JarvisError.connectionClosed)
+                default: break
+                }
+            }
+            c.start(queue: DispatchQueue(label: "jarvis.mqtt"))
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { gate.fail(JarvisError.timeout) }
+        }
     }
 
     private func send(packet: Data) async throws {
@@ -337,24 +355,25 @@ private actor MQTTConnection {
     private func receivePacket(timeout: TimeInterval) async throws -> Data? {
         if let complete = extractPacket() { return complete }
         guard let c = connection else { throw JarvisError.connectionClosed }
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Data?, Error>) in
-            let timer = DispatchWorkItem { cont.resume(returning: nil) }
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timer)
-            c.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
-                timer.cancel()
-                Task {
-                    if let error { cont.resume(throwing: error); return }
-                    if let data { await self?.buffer.append(data) }
-                    if isComplete { cont.resume(throwing: JarvisError.connectionClosed); return }
-                    do { cont.resume(returning: await self?.extractPacket()) } catch { cont.resume(throwing: error) }
-                }
+
+        let incoming: Data? = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data?, Error>) in
+            let gate = TransportContinuationGate<Data?>(continuation)
+            c.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
+                if let error { gate.fail(error) }
+                else if isComplete && (data == nil || data!.isEmpty) { gate.fail(JarvisError.connectionClosed) }
+                else { gate.succeed(data) }
             }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { gate.succeed(nil) }
         }
+
+        if let incoming, !incoming.isEmpty { buffer.append(incoming) }
+        return extractPacket()
     }
 
     private func extractPacket() -> Data? {
         guard buffer.count >= 2 else { return nil }
         let (length, used) = MQTTConnection.decodeRemaining(buffer, from: 1)
+        guard used > 0 else { return nil }
         let total = 1 + used + length
         guard buffer.count >= total else { return nil }
         let packet = Data(buffer.prefix(total)); buffer.removeFirst(total); return packet
@@ -369,12 +388,12 @@ private actor MQTTConnection {
     private static func decodeRemaining(_ data: Data, from start: Int) -> (Int, Int) {
         var multiplier = 1, value = 0, used = 0
         var i = start
-        while i < data.count {
+        while i < data.count && used < 4 {
             let byte = Int(data[i]); used += 1; value += (byte & 127) * multiplier
-            if byte & 128 == 0 { break }
+            if byte & 128 == 0 { return (value, used) }
             multiplier *= 128; i += 1
         }
-        return (value, used)
+        return (0, 0)
     }
 }
 
@@ -396,42 +415,31 @@ private final class FTPSClient {
         let params = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
         let c = NWConnection(host: NWEndpoint.Host(host), port: 990, using: params)
         control = c
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            var done = false
-            c.stateUpdateHandler = { state in
-                guard !done else { return }
-                switch state {
-                case .ready: done = true; cont.resume()
-                case .failed(let e): done = true; cont.resume(throwing: e)
-                case .cancelled: done = true; cont.resume(throwing: JarvisError.connectionClosed)
-                default: break
-                }
-            }
-            c.start(queue: DispatchQueue(label: "jarvis.ftps.control"))
-        }
-        _ = try await readResponse()
-        try await command("USER \(username)")
-        try await command("PASS \(password)")
-        try await command("TYPE I")
+        try await waitUntilReady(c, timeout: 7)
+        _ = try await readResponse(timeout: 7)
+        _ = try await command("USER \(username)")
+        _ = try await command("PASS \(password)")
+        _ = try await command("TYPE I")
     }
 
     func upload(fileURL: URL, remoteName: String) async throws {
-        try await command("PASV")
-        let response = try await readResponse()
+        let response = try await command("PASV")
         guard let port = Self.parsePassivePort(response) else { throw JarvisError.ftpProtocol(response) }
         let dataConnection = try await makeDataConnection(port: port)
-        try await command("STOR \(remoteName)")
+        _ = try await command("STOR \(remoteName)")
 
         guard let stream = InputStream(url: fileURL) else { throw JarvisError.fileReadFailed }
         stream.open(); defer { stream.close() }
-        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
-        while stream.hasBytesAvailable {
-            let count = stream.read(&buffer, maxLength: buffer.count)
-            if count <= 0 { break }
-            try await send(data: Data(buffer[0..<count]), on: dataConnection)
+        var bytes = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let count = stream.read(&bytes, maxLength: bytes.count)
+            if count < 0 { throw stream.streamError ?? JarvisError.fileReadFailed }
+            if count == 0 { break }
+            try await send(data: Data(bytes[0..<count]), on: dataConnection)
         }
         dataConnection.cancel()
-        _ = try await readResponse()
+        let completion = try await readResponse(timeout: 15)
+        guard completion.hasPrefix("2") else { throw JarvisError.ftpProtocol(completion) }
     }
 
     func close() async {
@@ -441,25 +449,30 @@ private final class FTPSClient {
         control = nil
     }
 
+    private func waitUntilReady(_ c: NWConnection, timeout: TimeInterval) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let gate = TransportContinuationGate<Void>(continuation)
+            c.stateUpdateHandler = { state in
+                switch state {
+                case .ready: gate.succeed(())
+                case .failed(let error): gate.fail(error)
+                case .cancelled: gate.fail(JarvisError.connectionClosed)
+                default: break
+                }
+            }
+            c.start(queue: DispatchQueue(label: "jarvis.ftps"))
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { gate.fail(JarvisError.timeout) }
+        }
+    }
+
     private func makeDataConnection(port: UInt16) async throws -> NWConnection {
         let tls = NWProtocolTLS.Options()
         sec_protocol_options_set_min_tls_protocol_version(tls.securityProtocolOptions, .TLSv12)
         sec_protocol_options_set_verify_block(tls.securityProtocolOptions, { _, _, complete in complete(true) }, DispatchQueue.global(qos: .utility))
         let params = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
-        let c = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: params)
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            var done = false
-            c.stateUpdateHandler = { state in
-                guard !done else { return }
-                switch state {
-                case .ready: done = true; cont.resume()
-                case .failed(let e): done = true; cont.resume(throwing: e)
-                case .cancelled: done = true; cont.resume(throwing: JarvisError.connectionClosed)
-                default: break
-                }
-            }
-            c.start(queue: DispatchQueue(label: "jarvis.ftps.data"))
-        }
+        guard let endpointPort = NWEndpoint.Port(rawValue: port) else { throw JarvisError.ftpProtocol("Invalid passive FTP port") }
+        let c = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: params)
+        try await waitUntilReady(c, timeout: 7)
         return c
     }
 
@@ -471,7 +484,8 @@ private final class FTPSClient {
         }
     }
 
-    private func command(_ text: String) async throws {
+    @discardableResult
+    private func command(_ text: String) async throws -> String {
         guard let c = control else { throw JarvisError.connectionClosed }
         let data = Data("\(text)\r\n".utf8)
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
@@ -479,22 +493,32 @@ private final class FTPSClient {
                 if let error { cont.resume(throwing: error) } else { cont.resume() }
             })
         }
-        let response = try await readResponse()
+        let response = try await readResponse(timeout: 10)
         guard response.hasPrefix("2") || response.hasPrefix("3") else { throw JarvisError.ftpProtocol(response) }
+        return response
     }
 
-    private func readResponse() async throws -> String {
-        if let line = extractLine() { return line }
-        guard let c = control else { throw JarvisError.connectionClosed }
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
-            c.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, complete, error in
-                if let error { cont.resume(throwing: error); return }
-                if let data { self?.controlBuffer.append(data) }
-                if complete { cont.resume(throwing: JarvisError.connectionClosed); return }
-                if let line = self?.extractLine() { cont.resume(returning: line) }
-                else { Task { try? await Task.sleep(nanoseconds: 10_000_000); do { cont.resume(returning: try await self!.readResponse()) } catch { cont.resume(throwing: error) } } }
+    private func readResponse(timeout: TimeInterval) async throws -> String {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let line = extractLine() { return line }
+            guard let c = control else { throw JarvisError.connectionClosed }
+
+            let incoming: Data? = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data?, Error>) in
+                let gate = TransportContinuationGate<Data?>(continuation)
+                c.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, complete, error in
+                    if let error { gate.fail(error) }
+                    else if complete && (data == nil || data!.isEmpty) { gate.fail(JarvisError.connectionClosed) }
+                    else { gate.succeed(data) }
+                }
+                let remaining = max(0.05, deadline.timeIntervalSinceNow)
+                DispatchQueue.global().asyncAfter(deadline: .now() + remaining) { gate.succeed(nil) }
             }
+
+            guard let incoming else { break }
+            if !incoming.isEmpty { controlBuffer.append(incoming) }
         }
+        throw JarvisError.timeout
     }
 
     private func extractLine() -> String? {
@@ -508,7 +532,29 @@ private final class FTPSClient {
         guard let open = response.firstIndex(of: "("), let close = response.firstIndex(of: ")") else { return nil }
         let nums = response[response.index(after: open)..<close].split(separator: ",").compactMap { UInt16($0.trimmingCharacters(in: .whitespaces)) }
         guard nums.count == 6 else { return nil }
-        return nums[4] * 256 + nums[5]
+        let value = UInt32(nums[4]) * 256 + UInt32(nums[5])
+        guard value > 0, value <= UInt32(UInt16.max) else { return nil }
+        return UInt16(value)
+    }
+}
+
+private final class TransportContinuationGate<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Error>?
+
+    init(_ continuation: CheckedContinuation<Value, Error>) {
+        self.continuation = continuation
+    }
+
+    func succeed(_ value: Value) { finish(.success(value)) }
+    func fail(_ error: Error) { finish(.failure(error)) }
+
+    private func finish(_ result: Result<Value, Error>) {
+        lock.lock()
+        guard let continuation else { lock.unlock(); return }
+        self.continuation = nil
+        lock.unlock()
+        continuation.resume(with: result)
     }
 }
 
@@ -520,6 +566,8 @@ enum JarvisError: LocalizedError {
     case fileReadFailed
     case invalidFileType
     case ftpProtocol(String)
+    case authenticationFailed(Int)
+    case subscriptionRejected
 
     var errorDescription: String? {
         switch self {
@@ -530,6 +578,8 @@ enum JarvisError: LocalizedError {
         case .fileReadFailed: return "Jarvis could not read the 3MF file."
         case .invalidFileType: return "Please choose a pre-sliced .3mf or .gcode.3mf file."
         case .ftpProtocol(let response): return "P1S file transfer error: \(response)"
+        case .authenticationFailed(let code): return "The P1S rejected the LAN login (MQTT code \(code)). Re-check the printer IP and LAN access code."
+        case .subscriptionRejected: return "The P1S rejected the MQTT status subscription."
         }
     }
 }

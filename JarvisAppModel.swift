@@ -1,5 +1,8 @@
 import Foundation
 import Combine
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
 
 @MainActor
 final class JarvisAppModel: ObservableObject {
@@ -9,12 +12,17 @@ final class JarvisAppModel: ObservableObject {
     @Published var isBusy = false
     @Published var showSetup = false
     @Published var pendingPrintName: String?
+    @Published var brainStatus = "INITIALIZING"
+    @Published var memoryCount = 0
 
     let speech = SpeechService()
     private let parser = CommandParser()
     private let modelProvider: ModelProvider = MakerWorldProvider()
+    private let brain = JarvisBrain()
     private var printer: PrinterTransport?
     private var pendingPrint: PendingPrint?
+    private var memories: [String] = []
+    private var didStartVoiceLink = false
 
     private struct PendingPrint {
         let candidate: ModelCandidate
@@ -23,9 +31,12 @@ final class JarvisAppModel: ObservableObject {
     }
 
     var configured: Bool {
-        UserDefaults.standard.string(forKey: "p1s.host") != nil &&
-        UserDefaults.standard.string(forKey: "p1s.serial") != nil &&
-        Keychain.get("p1s.accessCode") != nil
+        guard let host = UserDefaults.standard.string(forKey: "p1s.host"),
+              let serial = UserDefaults.standard.string(forKey: "p1s.serial"),
+              let code = Keychain.get("p1s.accessCode") else { return false }
+        return !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+               !serial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+               !code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var makerWorldSignedIn: Bool {
@@ -38,11 +49,36 @@ final class JarvisAppModel: ObservableObject {
     }
 
     init() {
+        memories = UserDefaults.standard.stringArray(forKey: "jarvis.memories") ?? []
+        memoryCount = memories.count
+
+        speech.onCommand = { [weak self] command in
+            self?.handle(command)
+        }
+
         rebuildPrinter()
+        brainStatus = brain.availabilityLabel
+
         if !configured {
             showSetup = true
         } else {
             Task { await getStatus(showSuccessMessage: false) }
+        }
+    }
+
+    func startVoiceLinkIfNeeded() {
+        guard !didStartVoiceLink else { return }
+        didStartVoiceLink = true
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.speech.startAlwaysListening()
+                self.reply("Voice link active. Say “Hey Jarvis” whenever you need me.", speak: false)
+                self.speech.prepareNaturalVoice()
+            } catch {
+                self.didStartVoiceLink = false
+                self.reply("Voice wake-up is unavailable: \(error.localizedDescription). You can still type commands.", speak: false)
+            }
         }
     }
 
@@ -55,7 +91,8 @@ final class JarvisAppModel: ObservableObject {
         Keychain.set(cleanCode, for: "p1s.accessCode")
         rebuildPrinter()
         status = PrinterStatus()
-        messages.append(("P1S connection saved. Testing the local connection…", false))
+        ams = AMSState()
+        reply("P1S connection saved. Testing the local connection…", speak: false)
         Task { await getStatus(showSuccessMessage: true) }
     }
 
@@ -70,10 +107,10 @@ final class JarvisAppModel: ObservableObject {
                 password: password,
                 verificationCode: verificationCode
             )
-            messages.append((result.message, false))
+            reply(result.message, speak: false)
             objectWillChange.send()
         } catch {
-            messages.append(("MakerWorld sign-in failed: \(error.localizedDescription)", false))
+            reply("MakerWorld sign-in failed: \(error.localizedDescription)", speak: false)
         }
     }
 
@@ -93,6 +130,8 @@ final class JarvisAppModel: ObservableObject {
         guard !clean.isEmpty else { return }
         messages.append((clean, true))
 
+        if handleMemoryCommand(clean) { return }
+
         if pendingPrint != nil {
             switch parser.parse(clean) {
             case .confirmPrint:
@@ -100,30 +139,94 @@ final class JarvisAppModel: ObservableObject {
             case .declinePrint, .cancel:
                 cancelPendingPrint()
             default:
-                messages.append(("I found a print and I'm waiting for your confirmation. Say yes to print it or no to cancel.", false))
+                reply("I have a print waiting for authorization. Say yes to print it or no to cancel.")
             }
             return
         }
 
+        switch parser.parse(clean) {
+        case .status:
+            guardPrinterConfigured { Task { await self.getStatus(showSuccessMessage: true) } }
+        case .pause:
+            guardPrinterConfigured { Task { await self.printerAction("pause") { try await self.requirePrinter().pause() } } }
+        case .resume:
+            guardPrinterConfigured { Task { await self.printerAction("resume") { try await self.requirePrinter().resume() } } }
+        case .cancel:
+            guardPrinterConfigured { Task { await self.printerAction("stop") { try await self.requirePrinter().cancel() } } }
+        case .findAndPrint(let query, let color, let slot):
+            guardPrinterConfigured { Task { await self.searchForPrint(query: query, color: color, slot: slot) } }
+        case .confirmPrint:
+            reply("There isn't a pending model to confirm.")
+        case .declinePrint:
+            reply("There isn't a pending print to cancel.")
+        case .unknown:
+            Task { await generalConversation(clean) }
+        }
+    }
+
+    private func guardPrinterConfigured(_ action: () -> Void) {
         guard configured else {
-            messages.append(("I need your P1S connection details first. Open Setup and enter the printer IP, serial number, and LAN access code.", false))
+            reply("I need the P1S connection details first. Open Settings and add the printer IP, serial number, and LAN access code.")
             showSetup = true
             return
         }
+        action()
+    }
 
-        switch parser.parse(clean) {
-        case .status: Task { await getStatus(showSuccessMessage: true) }
-        case .pause: Task { await printerAction("pause") { try await self.requirePrinter().pause() } }
-        case .resume: Task { await printerAction("resume") { try await self.requirePrinter().resume() } }
-        case .cancel: Task { await printerAction("stop") { try await self.requirePrinter().cancel() } }
-        case .findAndPrint(let query, let color, let slot):
-            Task { await searchForPrint(query: query, color: color, slot: slot) }
-        case .confirmPrint:
-            messages.append(("There isn't a pending model to confirm. Tell me what you want to print first.", false))
-        case .declinePrint:
-            messages.append(("There isn't a pending print to cancel.", false))
-        case .unknown:
-            messages.append(("Try “print a Benchy in red using slot 3.” I'll search MakerWorld, show you what I found, and wait for your confirmation before printing.", false))
+    private func handleMemoryCommand(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        let rememberPrefixes = ["remember that ", "remember "]
+        for prefix in rememberPrefixes where lower.hasPrefix(prefix) {
+            let index = text.index(text.startIndex, offsetBy: prefix.count)
+            let item = String(text[index...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !item.isEmpty else { return false }
+            memories.append(item)
+            memories = Array(memories.suffix(40))
+            saveMemories()
+            reply("Understood. I'll remember that.")
+            return true
+        }
+
+        if lower.contains("what do you remember") || lower.contains("what have you remembered") {
+            if memories.isEmpty {
+                reply("I don't have any saved memories yet.")
+            } else {
+                let summary = memories.suffix(8).enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
+                reply("Here's what I currently remember:\n\(summary)", speak: false)
+                speech.speak("I have \(memories.count) saved memories. They're displayed on screen.")
+            }
+            return true
+        }
+
+        if lower == "forget everything" || lower == "clear your memory" {
+            memories.removeAll()
+            saveMemories()
+            reply("Memory cleared.")
+            return true
+        }
+
+        return false
+    }
+
+    private func saveMemories() {
+        UserDefaults.standard.set(memories, forKey: "jarvis.memories")
+        memoryCount = memories.count
+    }
+
+    private func generalConversation(_ text: String) async {
+        guard !isBusy else { return }
+        isBusy = true
+        brainStatus = "THINKING"
+        defer {
+            isBusy = false
+            brainStatus = brain.availabilityLabel
+        }
+
+        do {
+            let response = try await brain.respond(to: text, memories: memories)
+            reply(response)
+        } catch {
+            reply("My on-device intelligence isn't available right now. Printer controls and voice commands are still online. \(error.localizedDescription)")
         }
     }
 
@@ -133,11 +236,25 @@ final class JarvisAppModel: ObservableObject {
         defer { isBusy = false }
 
         do {
-            messages.append(("Confirmed. Downloading \(pending.candidate.name)…", false))
+            reply("Confirmed. Downloading \(pending.candidate.name)…", speak: false)
             let fileURL = try await modelProvider.download(profile: pending.candidate)
-            let chosenSlot = pending.requestedSlot ?? bestCachedSlot(for: pending.requestedColor) ?? 1
+
+            let chosenSlot: Int
+            if let requestedSlot = pending.requestedSlot {
+                chosenSlot = requestedSlot
+            } else if let color = pending.requestedColor {
+                if let cached = bestCachedSlot(for: color) {
+                    chosenSlot = cached
+                } else {
+                    await refreshAMSState()
+                    chosenSlot = bestCachedSlot(for: color) ?? 1
+                }
+            } else {
+                chosenSlot = 1
+            }
+
             guard (1...4).contains(chosenSlot) else {
-                messages.append(("AMS slots are 1 through 4.", false))
+                reply("AMS slots are one through four.")
                 clearPendingPrint()
                 return
             }
@@ -149,20 +266,20 @@ final class JarvisAppModel: ObservableObject {
                 confidence: pending.requestedColor == nil ? 0.7 : 0.95
             )]
 
-            messages.append(("Sending \(pending.candidate.name) to the P1S using AMS slot \(chosenSlot)\(pending.requestedColor.map { " (\($0))" } ?? "")…", false))
+            reply("Sending \(pending.candidate.name) to the P1S using AMS slot \(chosenSlot)…", speak: false)
             let p = try requirePrinter()
             try await p.uploadAndStart(fileURL: fileURL, displayName: pending.candidate.name, mappings: mapping)
-            messages.append(("Print command sent to the P1S.", false))
+            reply("Print command sent to the P1S.")
             clearPendingPrint()
         } catch {
-            messages.append(("I couldn't complete that print: \(error.localizedDescription)", false))
+            reply("I couldn't complete that print: \(error.localizedDescription)")
         }
     }
 
     func cancelPendingPrint() {
         guard pendingPrint != nil else { return }
         clearPendingPrint()
-        messages.append(("Okay. I cancelled that print before sending anything to the P1S.", false))
+        reply("Cancelled. Nothing was sent to the P1S.")
     }
 
     private func clearPendingPrint() {
@@ -181,7 +298,7 @@ final class JarvisAppModel: ObservableObject {
               let serial = UserDefaults.standard.string(forKey: "p1s.serial"),
               let code = Keychain.get("p1s.accessCode"),
               !host.isEmpty, !serial.isEmpty, !code.isEmpty else {
-            messages.append(("P1S connection details are incomplete. Open Setup and check them.", false))
+            reply("P1S connection details are incomplete. Open Settings and check them.")
             return
         }
 
@@ -192,19 +309,30 @@ final class JarvisAppModel: ObservableObject {
             let probe = P1SStatusProbe(host: host, serial: serial, accessCode: code)
             let newStatus = try await probe.fetchStatus()
             status = newStatus
+            await refreshAMSState()
             if showSuccessMessage {
-                messages.append(("P1S connected. Printer state: \(newStatus.state.rawValue). \(Int(newStatus.progress))% complete.", false))
+                let job = newStatus.jobName.map { " Current job: \($0)." } ?? ""
+                reply("P1S is \(newStatus.state.rawValue). \(Int(newStatus.progress)) percent complete.\(job)")
             }
         } catch {
             status = PrinterStatus(state: .offline, errorMessage: error.localizedDescription)
-            messages.append(("P1S connection failed: \(error.localizedDescription)", false))
+            reply("I can't reach the P1S right now: \(error.localizedDescription)")
+        }
+    }
+
+    private func refreshAMSState() async {
+        guard let printer else { return }
+        do {
+            ams = try await printer.amsState()
+        } catch {
+            // AMS data is helpful for color selection but should not make printer status fail.
         }
     }
 
     private func searchForPrint(query: String, color: String?, slot: Int?) async {
         guard !isBusy else { return }
         guard makerWorldSignedIn else {
-            messages.append(("Before I can download MakerWorld print profiles, connect your Bambu/MakerWorld account once in Setup. Your password is used only for the sign-in request; Jarvis stores the returned access token in the iPhone Keychain.", false))
+            reply("Connect your MakerWorld account once in Settings before I can download print profiles.")
             showSetup = true
             return
         }
@@ -213,7 +341,7 @@ final class JarvisAppModel: ObservableObject {
         defer { isBusy = false }
 
         do {
-            messages.append(("Searching MakerWorld for a P1S-ready \(query)…", false))
+            reply("Searching MakerWorld for a P1S-ready \(query)…", speak: false)
             let results = try await modelProvider.searchPrintProfiles(
                 query: query,
                 printer: "Bambu Lab P1S",
@@ -221,7 +349,7 @@ final class JarvisAppModel: ObservableObject {
                 material: "PLA"
             )
             guard let best = results.first else {
-                messages.append(("I couldn't find a usable P1S MakerWorld result for “\(query)”. Try a more specific name.", false))
+                reply("I couldn't find a usable P1S MakerWorld result for \(query).")
                 return
             }
 
@@ -229,10 +357,9 @@ final class JarvisAppModel: ObservableObject {
             pendingPrintName = best.name
             let slotText = slot.map { " using AMS slot \($0)" } ?? ""
             let colorText = color.map { " in \($0)" } ?? ""
-            let details = best.notes.map { " \($0)." } ?? ""
-            messages.append(("I found “\(best.name)” on MakerWorld.\(details)\(colorText)\(slotText) I have NOT sent anything to the printer. Do you want me to download and print it?", false))
+            reply("I found \(best.name)\(colorText)\(slotText). It's ready for your authorization. Do you want me to print it?")
         } catch {
-            messages.append(("Online model search failed: \(error.localizedDescription)", false))
+            reply("Online model search failed: \(error.localizedDescription)")
         }
     }
 
@@ -247,9 +374,75 @@ final class JarvisAppModel: ObservableObject {
         defer { isBusy = false }
         do {
             try await action()
-            messages.append(("P1S \(name) command sent.", false))
+            reply("P1S \(name) command sent.")
         } catch {
-            messages.append(("I couldn't send the \(name) command: \(error.localizedDescription)", false))
+            reply("I couldn't send the \(name) command: \(error.localizedDescription)")
         }
+    }
+
+    private func reply(_ text: String, speak: Bool = true) {
+        messages.append((text, false))
+        if speak {
+            speech.speak(text.replacingOccurrences(of: "\n", with: " "))
+        }
+    }
+}
+
+@MainActor
+private final class JarvisBrain {
+    #if canImport(FoundationModels)
+    private var session: LanguageModelSession?
+    #endif
+
+    var availabilityLabel: String {
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, *) {
+            return SystemLanguageModel.default.isAvailable ? "ON-DEVICE AI" : "AI UNAVAILABLE"
+        }
+        #endif
+        return "CORE COMMANDS"
+    }
+
+    func respond(to prompt: String, memories: [String]) async throws -> String {
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, *), SystemLanguageModel.default.isAvailable {
+            if session == nil {
+                session = LanguageModelSession(instructions: """
+                You are Jarvis, a polished personal AI assistant running locally on the user's iPhone. Be calm, concise, capable, observant, and lightly witty. Prefer short spoken-friendly answers unless detail is requested. Never claim you performed an action unless the app actually did it. Printer actions are handled by dedicated app controls, so do not pretend to start, pause, cancel, or modify a print. If asked about something that requires live internet data, say that live web lookup is not connected yet instead of inventing current information.
+                """)
+            }
+
+            let memoryContext = memories.isEmpty
+                ? "No saved user memories."
+                : "Saved user memories:\n" + memories.suffix(20).map { "- \($0)" }.joined(separator: "\n")
+
+            let response = try await session!.respond(to: """
+                \(memoryContext)
+
+                User: \(prompt)
+                Respond naturally as Jarvis.
+                """)
+            return response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        #endif
+
+        return fallbackResponse(for: prompt)
+    }
+
+    private func fallbackResponse(for prompt: String) -> String {
+        let lower = prompt.lowercased()
+        if lower.contains("what time") {
+            return "It's \(Date.now.formatted(date: .omitted, time: .shortened))."
+        }
+        if lower.contains("what day") || lower.contains("date") {
+            return "Today is \(Date.now.formatted(date: .complete, time: .omitted))."
+        }
+        if lower.contains("who are you") || lower.contains("what are you") {
+            return "I'm Jarvis. Voice link, local memory, and printer control are online. My full on-device AI brain will activate when Apple Intelligence is available to this build."
+        }
+        if lower.contains("hello") || lower == "hi" || lower == "hey" {
+            return "Hello. What can I do for you?"
+        }
+        return "I heard you. My core commands are online, but the full on-device language model isn't available to this build yet."
     }
 }

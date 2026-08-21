@@ -1,15 +1,14 @@
 name: Jarvis iOS Build
 
-# Do not build every intermediate code commit. That created a notification storm
-# while Jarvis was being developed. Build the installable IPA only when:
-#   1) this workflow itself changes, or
-#   2) a version tag such as v0.2.0 is pushed, or
-#   3) the workflow is started manually from GitHub Actions.
+# Build the Jarvis HUD branch when app source or this workflow changes,
+# or when started manually.
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - "jarvis-hud-ui"
     paths:
+      - "*.swift"
+      - "JarvisP1S.xcodeproj/**"
       - ".github/workflows/ios-build.yml"
   workflow_dispatch:
 
@@ -19,7 +18,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-15-intel
+    runs-on: macos-26
     steps:
       - name: Checkout current commit
         uses: actions/checkout@v4
@@ -27,62 +26,103 @@ jobs:
           fetch-depth: 1
           clean: true
 
-      - name: Show source and Xcode version
+      - name: Select stable Xcode 26
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Show source and verify project
         run: |
           echo "Building commit: $GITHUB_SHA"
-          xcodebuild -version
-          grep -F "MakerWorld search" ContentView.swift
-          if grep -Fq "Import sliced 3MF" ContentView.swift; then
-            echo "ERROR: checkout contains the old UI source"
-            exit 1
+          grep -F "ALWAYS LISTENING" ContentView.swift
+          grep -F "FoundationModels" JarvisAppModel.swift
+          grep -F "hey jarvis" SpeechService.swift
+          grep -F "KokoroSwift" SpeechService.swift
+          grep -F "IPHONEOS_DEPLOYMENT_TARGET = 26.0" JarvisP1S.xcodeproj/project.pbxproj
+          grep -F 'LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"' JarvisP1S.xcodeproj/project.pbxproj
+
+      - name: Ensure Metal toolchain is available for MLX
+        run: |
+          set -euxo pipefail
+          if ! xcodebuild -showComponent MetalToolchain; then
+            xcodebuild -downloadComponent MetalToolchain
           fi
+          xcodebuild -showComponent MetalToolchain
+          xcrun -f metal
+          metal_path="$(xcrun -f metal)"
+          test -x "$metal_path"
+          "$metal_path" --version || true
+
+      - name: Resolve Swift packages
+        run: |
+          rm -rf DerivedData
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project JarvisP1S.xcodeproj \
+            -scheme JarvisP1S \
+            -derivedDataPath "$PWD/DerivedData" \
+            -skipPackagePluginValidation
 
       - name: Build Jarvis for iPhone from scratch
         run: |
-          rm -rf build Payload DerivedData JarvisP1S-unsigned.ipa
+          set -o pipefail
+          rm -rf build Payload JarvisP1S-unsigned.ipa
           xcodebuild \
             -project JarvisP1S.xcodeproj \
             -scheme JarvisP1S \
-            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -configuration Release \
             -derivedDataPath "$PWD/DerivedData" \
+            -skipPackagePluginValidation \
             CONFIGURATION_BUILD_DIR="$PWD/build/JarvisP1S" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            clean build
+            clean build | tee xcodebuild.log
 
-      - name: Verify compiled app is current
+      - name: Verify compiled app is launchable
         run: |
-          test -f build/JarvisP1S/JarvisP1S.app/JarvisP1S
-          strings build/JarvisP1S/JarvisP1S.app/JarvisP1S > compiled-strings.txt
-          grep -F "MakerWorld search" compiled-strings.txt
-          if grep -Fq "Import sliced 3MF" compiled-strings.txt; then
-            echo "ERROR: compiled app still contains the old Import sliced 3MF UI"
-            exit 1
-          fi
-          echo "Verified: compiled binary contains current MakerWorld UI and not the old import UI."
+          set -euxo pipefail
+          APP="build/JarvisP1S/JarvisP1S.app"
+          BIN="$APP/JarvisP1S"
+          test -f "$BIN"
+          test -d "$APP/Frameworks/KokoroSwift.framework"
+          test -f "$APP/Frameworks/KokoroSwift.framework/KokoroSwift"
+          strings "$BIN" > compiled-strings.txt
+          grep -F "ALWAYS LISTENING" compiled-strings.txt
+          grep -F "Hey Jarvis" compiled-strings.txt
+          otool -L "$BIN"
+          otool -l "$BIN" > load-commands.txt
+          grep -A3 LC_RPATH load-commands.txt | grep -F '@executable_path/Frameworks'
+          otool -L "$BIN" | grep -F '@rpath/KokoroSwift.framework/KokoroSwift'
+          echo "Verified: HUD/wake code is current, Kokoro is embedded, and the executable has the Frameworks runtime search path required by dyld."
 
       - name: Package and verify unsigned IPA
         run: |
+          set -euxo pipefail
+          rm -rf Payload verify-ipa
           mkdir -p Payload
           cp -R build/JarvisP1S/JarvisP1S.app Payload/JarvisP1S.app
           /usr/bin/zip -qry JarvisP1S-unsigned.ipa Payload
-          rm -rf verify-ipa
           mkdir verify-ipa
           ditto -x -k JarvisP1S-unsigned.ipa verify-ipa
-          strings verify-ipa/Payload/JarvisP1S.app/JarvisP1S > ipa-strings.txt
-          grep -F "MakerWorld search" ipa-strings.txt
-          if grep -Fq "Import sliced 3MF" ipa-strings.txt; then
-            echo "ERROR: packaged IPA contains old UI"
-            exit 1
-          fi
+          APP="verify-ipa/Payload/JarvisP1S.app"
+          BIN="$APP/JarvisP1S"
+          test -f "$BIN"
+          test -f "$APP/Frameworks/KokoroSwift.framework/KokoroSwift"
+          strings "$BIN" > ipa-strings.txt
+          grep -F "ALWAYS LISTENING" ipa-strings.txt
+          grep -F "Hey Jarvis" ipa-strings.txt
+          otool -l "$BIN" > ipa-load-commands.txt
+          grep -A3 LC_RPATH ipa-load-commands.txt | grep -F '@executable_path/Frameworks'
+          otool -L "$BIN" | grep -F '@rpath/KokoroSwift.framework/KokoroSwift'
           shasum -a 256 JarvisP1S-unsigned.ipa
           ls -lh JarvisP1S-unsigned.ipa
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: JarvisP1S-current-unsigned-IPA
+          name: Jarvis-HUD-unsigned-IPA
           path: JarvisP1S-unsigned.ipa
           if-no-files-found: error
           retention-days: 7
