@@ -15,6 +15,37 @@ struct JarvisVoiceChoice: Identifiable, Hashable {
     var label: String { "\(name) • \(language) • \(quality)" }
 }
 
+private actor NeuralVoiceEngine {
+    private var kokoro: KokoroTTS?
+    private var voices: [String: MLXArray] = [:]
+
+    func isReady() -> Bool {
+        kokoro != nil && !voices.isEmpty
+    }
+
+    func prepare(modelURL: URL, voicesURL: URL) throws {
+        if isReady() { return }
+        let loadedVoices = NpyzReader.read(fileFromPath: voicesURL) ?? [:]
+        guard !loadedVoices.isEmpty else {
+            throw NSError(domain: "JarvisNeuralVoice", code: 11, userInfo: [NSLocalizedDescriptionKey: "The neural voice style file could not be read."])
+        }
+        voices = loadedVoices
+        kokoro = KokoroTTS(modelPath: modelURL)
+    }
+
+    func generate(text: String, voiceIdentifier: String) throws -> [Float] {
+        guard let kokoro else {
+            throw NSError(domain: "JarvisNeuralVoice", code: 12, userInfo: [NSLocalizedDescriptionKey: "Natural voice engine is unavailable."])
+        }
+        let key = voiceIdentifier + ".npy"
+        guard let voice = voices[key] ?? voices["bm_george.npy"] else {
+            throw NSError(domain: "JarvisNeuralVoice", code: 13, userInfo: [NSLocalizedDescriptionKey: "Selected natural voice was not found."])
+        }
+        let (audio, _) = try kokoro.generateAudio(voice: voice, language: .enGB, text: text)
+        return audio
+    }
+}
+
 @MainActor
 final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @Published var isListening = false
@@ -35,14 +66,14 @@ final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
 
     private let neuralAudioEngine = AVAudioEngine()
     private let neuralPlayer = AVAudioPlayerNode()
-    private var kokoro: KokoroTTS?
-    private var kokoroVoices: [String: MLXArray] = [:]
+    private let neuralEngine = NeuralVoiceEngine()
     private var neuralPreparationTask: Task<Void, Never>?
     private var isPreparingNeuralVoice = false
 
     private var recognitionTask: SFSpeechRecognitionTask?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionSessionID = UUID()
+    private var hasInputTap = false
     private var commandDebounceTask: Task<Void, Never>?
     private var restartTask: Task<Void, Never>?
     private var conversationTimeoutTask: Task<Void, Never>?
@@ -51,6 +82,8 @@ final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
     private var conversationUntil: Date?
     private var lastDeliveredCommand = ""
     private var lastDeliveredAt = Date.distantPast
+    private var speechGenerationID = UUID()
+    private var activeFallbackUtterance: AVSpeechUtterance?
 
     private let wakeAliases = [
         "hey jarvis", "hey jervis", "okay jarvis", "ok jarvis", "yo jarvis",
@@ -146,6 +179,8 @@ final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         commandDebounceTask?.cancel()
         conversationTimeoutTask?.cancel()
         conversationUntil = nil
+        speechGenerationID = UUID()
+        activeFallbackUtterance = nil
         stopRecognitionSession()
         stopNeuralPlayback()
         if synthesizer.isSpeaking { synthesizer.stopSpeaking(at: .immediate) }
@@ -159,6 +194,9 @@ final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
 
+        let generationID = UUID()
+        speechGenerationID = generationID
+        activeFallbackUtterance = nil
         restartAfterSpeech = shouldKeepListening
         restartTask?.cancel()
         commandDebounceTask?.cancel()
@@ -172,11 +210,12 @@ final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.speakWithKokoro(clean)
+                try await self.speakWithKokoro(clean, generationID: generationID)
             } catch {
+                guard self.speechGenerationID == generationID else { return }
                 self.lastError = "Natural voice: \(error.localizedDescription)"
                 self.neuralVoiceStatus = "Natural voice unavailable — fallback active"
-                self.speakWithSystemFallback(clean)
+                self.speakWithSystemFallback(clean, generationID: generationID)
             }
         }
     }
@@ -195,14 +234,14 @@ final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
     }
 
     private func prepareKokoroIfNeeded(updateMainStatus: Bool = true) async throws {
-        if kokoro != nil, !kokoroVoices.isEmpty { return }
+        if await neuralEngine.isReady() { return }
 
         if isPreparingNeuralVoice {
             while isPreparingNeuralVoice {
                 try Task.checkCancellation()
                 try await Task.sleep(for: .milliseconds(150))
             }
-            guard kokoro != nil, !kokoroVoices.isEmpty else {
+            guard await neuralEngine.isReady() else {
                 throw NSError(domain: "JarvisNeuralVoice", code: 10, userInfo: [NSLocalizedDescriptionKey: "Natural voice setup did not finish."])
             }
             return
@@ -232,14 +271,7 @@ final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
 
         neuralVoiceStatus = "Loading natural voice…"
         if updateMainStatus { statusText = "LOADING NATURAL VOICE" }
-
-        let loadedVoices = NpyzReader.read(fileFromPath: voicesURL) ?? [:]
-        guard !loadedVoices.isEmpty else {
-            throw NSError(domain: "JarvisNeuralVoice", code: 11, userInfo: [NSLocalizedDescriptionKey: "The neural voice style file could not be read."])
-        }
-
-        kokoroVoices = loadedVoices
-        kokoro = KokoroTTS(modelPath: modelURL)
+        try await neuralEngine.prepare(modelURL: modelURL, voicesURL: voicesURL)
         neuralVoiceStatus = "Natural voice ready"
     }
 
@@ -258,18 +290,13 @@ final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         try fm.moveItem(at: temporaryURL, to: destination)
     }
 
-    private func speakWithKokoro(_ text: String) async throws {
+    private func speakWithKokoro(_ text: String, generationID: UUID) async throws {
         try await prepareKokoroIfNeeded()
-        guard let kokoro else {
-            throw NSError(domain: "JarvisNeuralVoice", code: 12, userInfo: [NSLocalizedDescriptionKey: "Natural voice engine is unavailable."])
-        }
+        guard speechGenerationID == generationID else { return }
 
-        let key = selectedVoiceIdentifier + ".npy"
-        guard let voice = kokoroVoices[key] ?? kokoroVoices["bm_george.npy"] else {
-            throw NSError(domain: "JarvisNeuralVoice", code: 13, userInfo: [NSLocalizedDescriptionKey: "Selected natural voice was not found."])
-        }
+        let audio = try await neuralEngine.generate(text: text, voiceIdentifier: selectedVoiceIdentifier)
+        guard speechGenerationID == generationID else { return }
 
-        let (audio, _) = try kokoro.generateAudio(voice: voice, language: .enGB, text: text)
         let sampleRate = Double(KokoroTTS.Constants.samplingRate)
         guard !audio.isEmpty,
               let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1),
@@ -293,10 +320,15 @@ final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         neuralAudioEngine.prepare()
         try neuralAudioEngine.start()
 
+        guard speechGenerationID == generationID else {
+            stopNeuralPlayback()
+            return
+        }
+
         statusText = "JARVIS SPEAKING"
         neuralVoiceStatus = "Natural voice ready"
         neuralPlayer.scheduleBuffer(buffer, at: nil, options: .interrupts) { [weak self] in
-            Task { @MainActor in self?.speechDidEnd() }
+            Task { @MainActor in self?.speechDidEnd(generationID: generationID) }
         }
         neuralPlayer.play()
     }
@@ -306,7 +338,8 @@ final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         if neuralAudioEngine.isRunning { neuralAudioEngine.stop() }
     }
 
-    private func speakWithSystemFallback(_ text: String) {
+    private func speakWithSystemFallback(_ text: String, generationID: UUID) {
+        guard speechGenerationID == generationID else { return }
         isSpeaking = true
         statusText = "JARVIS SPEAKING • FALLBACK"
         let utterance = AVSpeechUtterance(string: text)
@@ -314,6 +347,7 @@ final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         utterance.rate = 0.5
         utterance.pitchMultiplier = 1.0
         utterance.volume = 1.0
+        activeFallbackUtterance = utterance
         synthesizer.speak(utterance)
     }
 
@@ -359,13 +393,13 @@ final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         recognitionRequest = request
 
         let node = engine.inputNode
-        node.removeTap(onBus: 0)
         let format = node.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw NSError(domain: "JarvisSpeech", code: 5, userInfo: [NSLocalizedDescriptionKey: "The microphone audio format is unavailable."])
         }
 
         node.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in request.append(buffer) }
+        hasInputTap = true
         engine.prepare()
         try engine.start()
 
@@ -517,7 +551,10 @@ final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         recognitionTask = nil
         recognitionRequest = nil
         if engine.isRunning { engine.stop() }
-        engine.inputNode.removeTap(onBus: 0)
+        if hasInputTap {
+            engine.inputNode.removeTap(onBus: 0)
+            hasInputTap = false
+        }
         if !keepListeningState { isListening = false }
     }
 
@@ -526,20 +563,27 @@ final class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         if isSpeaking { statusText = "JARVIS SPEAKING" }
         else if isAwake && conversationIsActive { statusText = "CONVERSATION ACTIVE" }
         else if isListening { statusText = "LISTENING FOR JARVIS" }
-        else if isStarting { statusText = "VOICE LINK CONNECTING" }
         else { statusText = "VOICE LINK CONNECTING" }
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        Task { @MainActor [weak self] in self?.speechDidEnd() }
+        Task { @MainActor [weak self] in
+            guard let self, self.activeFallbackUtterance === utterance else { return }
+            self.activeFallbackUtterance = nil
+            self.speechDidEnd(generationID: self.speechGenerationID)
+        }
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        Task { @MainActor [weak self] in self?.speechDidEnd() }
+        Task { @MainActor [weak self] in
+            guard let self, self.activeFallbackUtterance === utterance else { return }
+            self.activeFallbackUtterance = nil
+            self.speechDidEnd(generationID: self.speechGenerationID)
+        }
     }
 
-    private func speechDidEnd() {
-        guard isSpeaking else { return }
+    private func speechDidEnd(generationID: UUID) {
+        guard speechGenerationID == generationID, isSpeaking else { return }
         isSpeaking = false
         stopNeuralPlayback()
         if restartAfterSpeech {
