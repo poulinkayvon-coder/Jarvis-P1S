@@ -1,7 +1,7 @@
 name: Jarvis iOS Build
 
 # Build main when app source or this workflow changes,
-# or when started manually.
+# or when started manually. This workflow is the canonical iOS build on main.
 on:
   push:
     branches:
