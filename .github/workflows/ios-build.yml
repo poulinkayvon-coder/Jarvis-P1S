@@ -1,11 +1,11 @@
 name: Jarvis iOS Build
 
-# Build the Jarvis HUD branch when app source or this workflow changes,
+# Build main when app source or this workflow changes,
 # or when started manually.
 on:
   push:
     branches:
-      - "jarvis-hud-ui"
+      - "main"
     paths:
       - "*.swift"
       - "JarvisP1S.xcodeproj/**"
